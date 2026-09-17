@@ -458,7 +458,7 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 
 		const options: Record<string, unknown> = { deliverAs: routed.channel };
 		if (routed.triggerTurn) options.triggerTurn = true;
-		await pi.sendMessage({ customType: "ai.typesafe.adversary", content: note, attribution: "agent" }, options);
+		await pi.sendMessage({ customType: "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
 		if (finalSeverity !== "blocker") nonBlockerEmittedThisUpdate += 1;
 		stats.delivered[finalSeverity] += 1;
 		if (routed.channel === "steer") {

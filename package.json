@@ -1,0 +1,11 @@
+{
+  "name": "omp-typesafe",
+  "version": "0.1.0",
+  "description": "TypeSafe AI (Jev) adversarial reviewer and typesafe_ask tool for the omp coding agent",
+  "private": true,
+  "type": "module",
+  "repository": "github:siddicky/omp-typesafe",
+  "keywords": ["omp", "oh-my-pi", "typesafe-ai", "jev", "adversarial-review", "extension"],
+  "omp": { "extensions": ["./src/index.ts"] },
+  "dependencies": { "@typesafe-ai/sdk": "^0.6.0" }
+}

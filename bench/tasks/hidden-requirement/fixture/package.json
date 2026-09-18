@@ -1,0 +1,5 @@
+{
+  "name": "hidden-requirement-fixture",
+  "private": true,
+  "type": "module"
+}

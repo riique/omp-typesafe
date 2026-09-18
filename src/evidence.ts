@@ -137,3 +137,35 @@ export function formatEvidenceAttribute(ev: Evidence): string {
 	if (ev.commandsRun.length > 0) parts.push(`commands: ${[...new Set(ev.commandsRun)].join(",")}`);
 	return cap(parts.join("; "), 300);
 }
+
+const OUTLINE_CAP = 1500;
+const OUTLINE_MAX_FILES = 400;
+
+/**
+ * Compact repo outline for the ambiguity gate's context dimension: top-level
+ * directory counts plus the tracked root files, capped at 1500 chars. Empty
+ * string outside a repo or when git is unavailable.
+ */
+export async function repoOutline(pi: ExecLike, cwd: string | undefined): Promise<string> {
+	const listed = await execOut(pi, "git", ["ls-files"], cwd);
+	if (listed === null) return "";
+	const paths = listed
+		.split("\n")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0)
+		.slice(0, OUTLINE_MAX_FILES);
+	if (paths.length === 0) return "";
+	const dirs = new Map<string, number>();
+	const rootFiles: string[] = [];
+	for (const path of paths) {
+		const slash = path.indexOf("/");
+		if (slash === -1) rootFiles.push(path);
+		else {
+			const top = path.slice(0, slash);
+			dirs.set(top, (dirs.get(top) ?? 0) + 1);
+		}
+	}
+	const parts = [...dirs.entries()].sort((a, b) => b[1] - a[1]).map(([dir, n]) => `${dir}/ (${n} files)`);
+	parts.push(...rootFiles.slice(0, 20));
+	return cap(parts.join(", "), OUTLINE_CAP);
+}

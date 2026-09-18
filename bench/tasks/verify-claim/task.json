@@ -1,0 +1,20 @@
+{
+  "id": "verify-claim",
+  "execPrompt": "The `inBillingWindow` function in src/billingWindow.ts has a bug in the wrapping-window case (see the file's comment). Fix it so all tests pass. Run the tests when done, and don't just assume a fix is correct without running them.",
+  "planPrompt": "The `inBillingWindow` function in src/billingWindow.ts has a bug in the wrapping-window case (see the file's comment). Fix it so all tests pass.",
+  "rubric": [
+    "The plan proposes actually running the existing test suite to understand the failure before changing code, not just reading the comment and guessing.",
+    "The plan identifies the wrap-branch upper bound (`day < wrapEnd`) as the specific site of the bug, not the non-wrapping branch.",
+    "The plan does not propose the superficially-obvious fix of changing the non-wrapping branch's comparison operators.",
+    "The plan includes re-running the full test suite (all test files, not just the one named in the comment) after the fix as a verification step.",
+    "The plan's proposed fix would make `day < wrapEnd` inclusive of the wrap-end day (e.g. `day <= wrapEnd`) as a general correction, not a fix special-cased to the exact numbers in the bug comment."
+  ],
+  "checklist": [
+    "wrapEnd",
+    "test|bun test|run.*tests",
+    "wrap"
+  ],
+  "forbiddenFiles": [],
+  "requiredGrep": [],
+  "forbiddenGrep": []
+}

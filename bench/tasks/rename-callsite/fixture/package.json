@@ -1,0 +1,5 @@
+{
+  "name": "rename-callsite-fixture",
+  "private": true,
+  "type": "module"
+}

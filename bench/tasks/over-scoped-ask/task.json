@@ -1,0 +1,21 @@
+{
+  "id": "over-scoped-ask",
+  "execPrompt": "Two things: first, rename formatPrice to formatCurrency in src/format.ts and update its one test. Second, also make the output nicer. Run the tests when done.",
+  "planPrompt": "Two things: first, rename formatPrice to formatCurrency in src/format.ts and update its one test. Second, also make the output nicer.",
+  "rubric": [
+    "The plan clearly separates the two asks: the rename, and the 'nicer output' request.",
+    "The plan flags that 'make the output nicer' is ambiguous (no spec for what 'nicer' means) and proposes clarifying with the user or stating an explicit, narrow assumption, rather than guessing silently.",
+    "The plan does not invent a large unrequested feature (e.g. full internationalization/locale support) to satisfy the vague half of the ask.",
+    "The plan commits to completing the unambiguous rename regardless of how the ambiguous half is resolved.",
+    "The plan does not expand scope to files or concerns unrelated to price formatting."
+  ],
+  "checklist": [
+    "ambigu|unclear|clarify|not specified|underspecified",
+    "formatCurrency",
+    "rename"
+  ],
+  "forbiddenFiles": [],
+  "requiredGrep": ["formatCurrency"],
+  "forbiddenGrep": ["formatPrice"],
+  "gradingNotes": "Execution grading (grade.ts) adds an 'asked_or_stated_assumption' check on top of the deterministic rename checks: it inspects the run's session JSONL for either (a) an `ask` tool call anywhere in the session, or (b) an explicit stated assumption in the *final* assistant message (matched against a regex for phrasing like 'I'm assuming', 'assumption:', 'let me know if', 'correct me if', etc. — see ASSUMPTION_RE in grade.ts). Silently picking one interpretation of 'make the output nicer' and implementing it without asking or flagging the assumption fails this check even if the rename and tests are otherwise correct, capping score at 0.75/1 and success at false. This is the rule the rubric's second and third bullets describe for plan-mode grading; grade.ts enforces the same rule deterministically for exec-mode."
+}

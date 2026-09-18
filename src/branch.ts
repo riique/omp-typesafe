@@ -123,13 +123,21 @@ export function renderDelta(entries: EntryView[], max = 6000): string {
 }
 
 /**
- * Heuristic plan-mode detection: a `custom_message` entry whose customType
- * mentions plan-mode context among recent entries. Unverified marker — when
- * absent this returns false and delivery falls back to documented behavior.
+ * Substrings that mark a `custom`/`custom_message` entry as plan-mode context,
+ * per the advisor doc's injected constraint context. Exported so callers and
+ * tests can reference the exact marker set instead of duplicating it.
+ */
+export const PLAN_MODE_MARKERS = ["plan-mode-context", "plan-mode-reference"] as const;
+
+/**
+ * Plan-mode detection: a `custom` or `custom_message` entry whose customType
+ * contains one of PLAN_MODE_MARKERS among recent entries.
  */
 export function planModeActive(entries: EntryView[]): boolean {
 	for (const e of entries.slice(-100)) {
-		if (e.type === "custom_message" && e.customType !== null && e.customType.includes("plan-mode-context")) {
+		if (e.type !== "custom" && e.type !== "custom_message") continue;
+		if (e.customType === null) continue;
+		if (PLAN_MODE_MARKERS.some((marker) => e.customType!.includes(marker))) {
 			return true;
 		}
 	}

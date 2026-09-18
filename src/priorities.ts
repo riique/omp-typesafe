@@ -2,10 +2,11 @@ import { homedir } from "node:os";
 import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { cap } from "./text";
+import type { TypesafeRole } from "./config";
 
 /**
- * ADVERSARY.md review priorities, mirroring WATCHDOG.md discovery:
- * user-level file first, then <dir>/ADVERSARY.md and <dir>/.omp/ADVERSARY.md
+ * ADVERSARY.md / WATCHDOG.md review priorities discovery:
+ * user-level file first, then <dir>/<fname> and <dir>/.omp/<fname>
  * for every directory from the git root (or $HOME) down to cwd.
  * Missing files are normal; total output capped.
  */
@@ -28,11 +29,16 @@ function ancestorDirs(cwd: string): string[] {
 	return out.reverse();
 }
 
-/** Collect and concatenate ADVERSARY.md files; empty string when none exist. */
-export async function loadPriorities(cwd: string): Promise<string> {
-	const files: string[] = [join(homedir(), ".omp", "agent", "ADVERSARY.md")];
+function priorityFileName(role: TypesafeRole): string {
+	return role === "advisory" ? "WATCHDOG.md" : "ADVERSARY.md";
+}
+
+/** Collect and concatenate priority files for the given role; empty string when none exist. */
+export async function loadPriorities(cwd: string, role: TypesafeRole = "adversarial"): Promise<string> {
+	const fname = priorityFileName(role);
+	const files: string[] = [join(homedir(), ".omp", "agent", fname)];
 	for (const dir of ancestorDirs(cwd)) {
-		files.push(join(dir, "ADVERSARY.md"), join(dir, ".omp", "ADVERSARY.md"));
+		files.push(join(dir, fname), join(dir, ".omp", fname));
 	}
 	const chunks: string[] = [];
 	let total = 0;

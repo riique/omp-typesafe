@@ -1,3 +1,4 @@
+import { homedir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { Questions } from "@typesafe-ai/sdk";
 import {
@@ -15,10 +16,12 @@ import {
 } from "./client";
 import type { WireAnswer } from "./client";
 import { getConfig, loadConfig } from "./config";
+import type { TypesafeRole } from "./config";
 import { loadPriorities } from "./priorities";
-import { collectEvidence, recordAction, resetEvidenceTurn } from "./evidence";
+import { collectEvidence, recordAction, repoOutline, resetEvidenceTurn } from "./evidence";
 import type { Evidence } from "./evidence";
-import { claimedIntent, lastUserText, priorActions, renderDelta, scanBranch } from "./branch";
+import { claimedIntent, lastUserText, planModeActive, priorActions, renderDelta, scanBranch } from "./branch";
+import type { EntryView } from "./branch";
 import {
 	beginTurn,
 	canReviewMessage,
@@ -29,8 +32,26 @@ import {
 	recordMessageReviewed,
 	resetReviewerSession,
 	review,
+	shouldEmit,
+	isSteerImmune,
 } from "./reviewer";
-import { fmt2, isRecord, stringifyInput, textFromContent } from "./text";
+import {
+	asksObserved,
+	buildBlockReason,
+	buildGateNote,
+	GATE_CUSTOM_TYPE,
+	getAmbiguityTelemetry,
+	getAsks,
+	getLastAmbiguityScore,
+	isProposeWrite,
+	proposeDecision,
+	recordAsk,
+	recordScore,
+	resetAmbiguitySession,
+	scoreAmbiguity,
+} from "./ambiguity";
+import type { AmbiguityResult, GateDecision, GateTrigger } from "./ambiguity";
+import { cap, fmt2, isRecord, stringifyInput, textFromContent } from "./text";
 
 /**
  * TypeSafe Adversary — advisor-pattern adversarial reviewer for omp, powered by
@@ -68,10 +89,27 @@ let priorities = "";
 let turnCursor = 0;
 const reviewedCallIds = new Set<string>();
 let sessionOverride: boolean | null = null;
+let sessionRoleOverride: TypesafeRole | null = null;
 let stopGateUses = 0;
+let planStartScored = false;
+let planPrompt = "";
 
 function reviewEnabled(): boolean {
 	return sessionOverride ?? getConfig().adversary.enabled;
+}
+
+function resolvedRole(): TypesafeRole {
+	return sessionRoleOverride ?? getConfig().role;
+}
+
+function roleLabel(role: TypesafeRole): string {
+	return role === "advisory" ? "TypeSafe Advisor" : "TypeSafe Adversary";
+}
+
+/** Gate a trigger on config.phases: plan-mode entries need "plan", everything else needs "execute". */
+function phaseAllowed(entries: EntryView[]): boolean {
+	const phases = getConfig().phases;
+	return planModeActive(entries) ? phases.includes("plan") : phases.includes("execute");
 }
 
 function notifyVia(ctx: NotifyCtx | undefined, logger: LoggerLike | undefined, message: string, level = "info"): void {
@@ -166,6 +204,27 @@ function buildWireQuestions(items: unknown): { questions?: Questions; error?: st
 	return { questions };
 }
 
+/**
+ * Ambiguity gate helpers. Everything here is defensive: any failure yields a
+ * "none" decision and the plan-mode flow continues untouched.
+ */
+
+interface GateCtxLike {
+	cwd?: string;
+	hasUI?: boolean;
+	sessionManager: { getBranch(): unknown[] };
+}
+
+/** Assistant text seen so far this plan, plus any plan file content written. */
+function planSoFar(entries: EntryView[], max = 6000): string {
+	const lines: string[] = [];
+	for (const e of entries) {
+		if (e.type !== "message" || !e.message) continue;
+		if (e.message.role === "assistant" && e.message.text.trim().length > 0) lines.push(e.message.text);
+	}
+	return cap(lines.join("\n"), max);
+}
+
 export default function typesafeExtension(pi: ExtensionAPI) {
 	pi.setLabel("TypeSafe Adversary");
 	const logger = pi.logger as LoggerLike | undefined;
@@ -173,15 +232,20 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await loadConfig(logger);
-		priorities = await loadPriorities(ctx.cwd);
+		sessionOverride = null;
+		sessionRoleOverride = null;
+		priorities = await loadPriorities(ctx.cwd, resolvedRole());
 		resetUsage();
 		resetClient();
 		resetReviewerSession();
 		resetEvidenceTurn();
 		reviewedCallIds.clear();
-		sessionOverride = null;
 		stopGateUses = 0;
+		resetAmbiguitySession();
+		planStartScored = false;
+		planPrompt = "";
 		turnCursor = ctx.sessionManager.getBranch().length;
+		pi.setLabel(roleLabel(resolvedRole()));
 		if (!apiKeyPresent()) {
 			logger?.warn?.("[typesafe] TYPESAFE_API_KEY is not set; adversary and typesafe_ask stay inactive");
 			notifyVia(ctx, logger, "TypeSafe adversary inactive: TYPESAFE_API_KEY not set", "warn");
@@ -201,21 +265,126 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		reviewedCallIds.clear();
 	});
 
+	// ---- ambiguity gate ------------------------------------------------------
+
+	/** Gate preconditions: plan mode, enabled, key present, ask budget left. */
+	const gateEligible = (entries: EntryView[]): boolean => {
+		const gcfg = getConfig().ambiguityGate;
+		if (!gcfg.enabled || !apiKeyPresent()) return false;
+		if (!planModeActive(entries)) return false;
+		return asksObserved() < gcfg.maxAsksPerPlan;
+	};
+
+	/** One scored gate evaluation; never throws, returns null when it could not score. */
+	const runGate = async (ctx: GateCtxLike, entries: EntryView[], trigger: GateTrigger, task: string): Promise<AmbiguityResult | null> => {
+		const gcfg = getConfig().ambiguityGate;
+		try {
+			const asked = getAsks();
+			const outline = await repoOutline(pi, ctx.cwd);
+			const evidence = await collectEvidence(pi, ctx.cwd);
+			const result = await scoreAmbiguity(pi, {
+				task: cap(task, 4000),
+				plan_so_far: planSoFar(entries),
+				questions_already_asked: asked.map((a) => a.question),
+				answers_received: asked.map((a) => a.answer),
+				evidence: { status: evidence.status ?? "", repo_outline: outline },
+			}, gcfg);
+			return result;
+		} catch (err) {
+			logger?.warn?.(`[typesafe] ambiguity scoring failed (${trigger}): ${describeError(err)}`);
+			return null;
+		}
+	};
+
+	const noteScore = (trigger: GateTrigger, result: AmbiguityResult, decision: GateDecision): void => {
+		recordScore({
+			ts: new Date().toISOString(),
+			trigger,
+			ambiguity: result.ambiguity,
+			dims: result.dims,
+			weakest: result.weakest,
+			gap: result.gap,
+			userCanAnswer: result.userCanAnswer,
+			decision,
+		});
+	};
+
+	/** Score and, when the task is still too ambiguous, steer the model to ask. */
+	const steerIfAmbiguous = async (ctx: GateCtxLike, entries: EntryView[], trigger: GateTrigger, task: string): Promise<void> => {
+		try {
+			if (!gateEligible(entries)) return;
+			const gcfg = getConfig().ambiguityGate;
+			const result = await runGate(ctx, entries, trigger, task);
+			if (!result) return;
+			if (result.ambiguity <= gcfg.threshold || result.userCanAnswer < gcfg.userCanAnswerFloor) {
+				noteScore(trigger, result, "none");
+				return;
+			}
+			// Emission guard: one steer per weakest dimension, and nothing during a steer's immune window.
+			if (isSteerImmune() || !shouldEmit(`gate|${result.weakest}`, 1)) {
+				noteScore(trigger, result, "none");
+				return;
+			}
+			await pi.sendMessage(
+				{ customType: GATE_CUSTOM_TYPE, content: buildGateNote(result, gcfg.threshold), display: true, attribution: "agent" },
+				{ deliverAs: "aside" },
+			);
+			noteScore(trigger, result, "steer");
+		} catch (err) {
+			logger?.warn?.(`[typesafe] ambiguity gate failed (${trigger}): ${describeError(err)}`);
+		}
+	};
+
+	pi.on("before_agent_start", async (event, ctx) => {
+		try {
+			const prompt = isRecord(event) && typeof event.prompt === "string" ? event.prompt : "";
+			if (prompt.trim().length > 0) planPrompt = prompt;
+			const entries = scanBranch(ctx.sessionManager.getBranch());
+			if (!planModeActive(entries) || planStartScored) return;
+			planStartScored = true;
+			await steerIfAmbiguous(ctx as GateCtxLike, entries, "plan_start", planPrompt || lastUserText(entries));
+		} catch (err) {
+			logger?.warn?.(`[typesafe] ambiguity plan_start failed: ${describeError(err)}`);
+		}
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		try {
+			if (!isRecord(event)) return;
+			const toolName = typeof event.toolName === "string" ? event.toolName : "";
+			if (toolName !== "write" || !isProposeWrite(event.input)) return;
+			const entries = scanBranch(ctx.sessionManager.getBranch());
+			const gcfg = getConfig().ambiguityGate;
+			if (!gcfg.enabled || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries)) return;
+			// Once the ask budget for this plan is spent, stop gating rather than looping.
+			if (asksObserved() >= gcfg.maxAsksPerPlan) return;
+			const result = await runGate(ctx as GateCtxLike, entries, "propose", planPrompt || lastUserText(entries));
+			if (!result) return;
+			const decision = proposeDecision(result, gcfg, ctx?.hasUI === true);
+			noteScore("propose", result, decision);
+			if (decision !== "block") return;
+			return { block: true, reason: buildBlockReason(result, gcfg.threshold) };
+		} catch (err) {
+			logger?.warn?.(`[typesafe] ambiguity propose gate failed: ${describeError(err)}`);
+		}
+	});
+
 	pi.on("turn_end", async (_event, ctx) => {
 		try {
 			const cfg = getConfig().adversary;
 			const entries = scanBranch(ctx.sessionManager.getBranch());
 			const deltaEntries = entries.slice(Math.max(0, Math.min(turnCursor, entries.length)));
 			turnCursor = entries.length;
-			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0) {
+			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries)) {
 				const delta = renderDelta(deltaEntries, 6000);
 				if (delta.trim().length > 0) {
 					const evidence = cfg.evidence ? await collectEvidence(pi, ctx.cwd) : undefined;
 					const state: Record<string, unknown> = { task: lastUserText(entries), review_priorities: priorities, delta };
 					if (evidence) state.evidence = evidence;
-					await review(pi, "turn", state, ctx, { evidence });
+					await review(pi, "turn", state, ctx, { evidence }, resolvedRole());
 				}
 			}
+			await steerIfAmbiguous(ctx as GateCtxLike, entries, "turn_end", planPrompt || lastUserText(entries));
 		} catch (err) {
 			logger?.warn?.(`[typesafe] turn_end review failed: ${describeError(err)}`);
 		} finally {
@@ -231,15 +400,16 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			if (!isRecord(raw) || raw.role !== "assistant") return;
 			const text = textFromContent(raw.content, 4000);
 			if (text.length < cfg.minMessageChars) return;
-			recordMessageReviewed();
 			const entries = scanBranch(ctx.sessionManager.getBranch());
+			if (!phaseAllowed(entries)) return;
+			recordMessageReviewed();
 			const state: Record<string, unknown> = {
 				task: lastUserText(entries),
 				review_priorities: priorities,
 				assistant_message: text,
 				recent_actions: priorActions(entries, 5),
 			};
-			await review(pi, "message", state, ctx);
+			await review(pi, "message", state, ctx, {}, resolvedRole());
 		} catch (err) {
 			logger?.warn?.(`[typesafe] message_end review failed: ${describeError(err)}`);
 		}
@@ -247,11 +417,16 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 
 	pi.on("tool_result", async (event, ctx) => {
 		try {
-			const cfg = getConfig().adversary;
-			if (!reviewEnabled() || !cfg.reviewActions || !apiKeyPresent()) return;
 			if (!isRecord(event)) return;
 			const toolName = typeof event.toolName === "string" ? event.toolName : "";
 			const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+			if (toolName === "ask") {
+				// Track answered questions so later ambiguity scores see them; no Jev call.
+				recordAsk(stringifyInput(event.input, 400), textFromContent(event.content, 400));
+				return;
+			}
+			const cfg = getConfig().adversary;
+			if (!reviewEnabled() || !cfg.reviewActions || !apiKeyPresent()) return;
 			if (toolName === "typesafe_ask" || !toolCallId) return;
 			if (!cfg.tools.includes(toolName)) return;
 			if (event.isError === true) return;
@@ -260,6 +435,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			recordAction(toolName);
 			const content = Array.isArray(event.content) ? event.content : [];
 			const entries = scanBranch(ctx.sessionManager.getBranch());
+			if (!phaseAllowed(entries)) return;
 			const evidence = cfg.evidence ? await collectEvidence(pi, ctx.cwd) : undefined;
 			const state: Record<string, unknown> = {
 				task: lastUserText(entries),
@@ -270,7 +446,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				prior_actions: priorActions(entries, 3),
 			};
 			if (evidence) state.evidence = evidence;
-			const outcome = await review(pi, "action", state, ctx, { toolCallId, evidence });
+			const outcome = await review(pi, "action", state, ctx, { toolCallId, evidence }, resolvedRole());
 			if (cfg.inlineActionNotes && outcome.note && outcome.decision === "delivered") {
 				// content is a full replacement — spread the original array back in.
 				return { content: [...content, { type: "text", text: `\n${outcome.note}` }] };
@@ -314,6 +490,27 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			};
 		} catch (err) {
 			logger?.warn?.(`[typesafe] stop gate failed: ${describeError(err)}`);
+		}
+	});
+
+	pi.on("session_shutdown", async () => {
+		const path = process.env.TYPESAFE_BENCH_LOG;
+		if (!path) return;
+		try {
+			const cfg = getConfig();
+			const payload = {
+				role: cfg.role,
+				phases: cfg.phases,
+				stats: getReviewStats(),
+				usage: getSessionUsage(),
+				costUsd: estimateCostUsd(),
+				lastResolvedModel: getLastResolvedModel(),
+				history: getReviewHistory(),
+				ambiguity: getAmbiguityTelemetry(),
+			};
+			await Bun.write(path, JSON.stringify(payload, null, 2));
+		} catch (err) {
+			logger?.warn?.(`[typesafe] bench log write failed: ${describeError(err)}`);
 		}
 	});
 
@@ -374,9 +571,10 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("adversary", {
-		description: "TypeSafe adversary reviewer: toggle | on | off | status | last | dump",
+		description: "TypeSafe adversary reviewer: toggle | on | off | status | last | dump | role",
 		handler: async (args, ctx) => {
-			const sub = typeof args === "string" ? args.trim().split(/\s+/)[0] ?? "" : "";
+			const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter((t) => t.length > 0) : [];
+			const sub = tokens[0] ?? "";
 			const cfg = getConfig();
 			if (sub === "") {
 				sessionOverride = !reviewEnabled();
@@ -384,6 +582,15 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			} else if (sub === "on" || sub === "off") {
 				sessionOverride = sub === "on";
 				notifyVia(ctx, logger, `TypeSafe adversary ${sub} for this session`);
+			} else if (sub === "role") {
+				const value = tokens[1];
+				if (value !== "advisory" && value !== "adversarial") {
+					notifyVia(ctx, logger, "usage: /adversary role advisory|adversarial", "warn");
+				} else {
+					sessionRoleOverride = value;
+					pi.setLabel(roleLabel(value));
+					notifyVia(ctx, logger, `TypeSafe role set to ${value} for this session`);
+				}
 			} else if (sub === "status") {
 				const stats = getReviewStats();
 				const usage = getSessionUsage();
@@ -393,11 +600,18 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 					.join(" ");
 				const lines = [
 					`adversary: ${reviewEnabled() ? "enabled" : "disabled"}${sessionOverride !== null ? ` (session override: ${sessionOverride ? "on" : "off"})` : ""}`,
+					`role: ${resolvedRole()}${sessionRoleOverride !== null ? ` (session override: ${sessionRoleOverride})` : ""}; phases: ${cfg.phases.join(",")}`,
 					`model: ${cfg.model}${resolved ? ` (last resolved: ${resolved})` : ""}`,
 					`api key: ${apiKeyPresent() ? "present" : "MISSING"}`,
 					`notes delivered: nit=${stats.delivered.nit} concern=${stats.delivered.concern} blocker=${stats.delivered.blocker}; downgraded=${stats.downgraded}; steers=${stats.steers}`,
 					`suppressed: ${suppressed || "none"}; errors=${stats.errors}`,
 					`usage: ${usage.requests} requests, ${usage.inputTokens} in / ${usage.outputTokens} out tokens, ~$${estimateCostUsd().toFixed(6)}`,
+					(() => {
+						const last = getLastAmbiguityScore();
+						const g = cfg.ambiguityGate;
+						if (!last) return `ambiguity gate: ${g.enabled ? "enabled" : "disabled"} (threshold ${fmt2(g.threshold)}); no score yet; asks observed=${asksObserved()}`;
+						return `ambiguity gate: ${g.enabled ? "enabled" : "disabled"} (threshold ${fmt2(g.threshold)}); last ${fmt2(last.ambiguity)} trigger=${last.trigger} weakest=${last.weakest} gap=${last.gap} decision=${last.decision}; asks observed=${asksObserved()}`;
+					})(),
 				];
 				notifyVia(ctx, logger, lines.join("\n"));
 			} else if (sub === "last") {
@@ -409,7 +623,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				await Bun.write(path, JSON.stringify(getReviewHistory(), null, 2));
 				notifyVia(ctx, logger, `adversary history written to ${path}`);
 			} else {
-				notifyVia(ctx, logger, "usage: /adversary [on|off|status|last|dump] (bare command toggles)", "warn");
+				notifyVia(ctx, logger, "usage: /adversary [on|off|status|last|dump|role advisory|adversarial] (bare command toggles)", "warn");
 			}
 		},
 	});

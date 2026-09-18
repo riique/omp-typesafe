@@ -1,0 +1,5 @@
+{
+  "name": "verify-claim-fixture",
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "hidden-requirement",
+  "execPrompt": "This CLI's arg parser only understands the short -v flag for verbose mode. We want to standardize on the long-form --verbose flag going forward, so add support for it in src/cli.ts. Some older internal scripts still call the tool with -v, so it needs to keep being recognized too. Run the tests when done.",
+  "planPrompt": "This CLI's arg parser only understands the short -v flag for verbose mode. We want to standardize on the long-form --verbose flag going forward, so add support for it in src/cli.ts. Some older internal scripts still call the tool with -v, so it needs to keep being recognized too.",
+  "rubric": [
+    "The plan explicitly commits to keeping the -v short flag working, not just adding --verbose.",
+    "The plan describes where the new long-flag handling is added (src/cli.ts's parseArgs).",
+    "The plan does not propose removing or renaming the -v flag.",
+    "The plan includes running the existing test suite (or adding a test) to confirm -v still works after the change.",
+    "The plan does not silently reinterpret 'add --verbose' as replacing -v."
+  ],
+  "checklist": [
+    "-v",
+    "--verbose",
+    "backward|compat|keep working|still work"
+  ],
+  "forbiddenFiles": [],
+  "requiredGrep": ["--verbose", "-v"],
+  "forbiddenGrep": []
+}

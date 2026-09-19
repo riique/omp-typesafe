@@ -1,6 +1,7 @@
 import { apiKeyPresent, ask, describeError, choice, noul, score } from "./client";
 import type { WireAnswer } from "./client";
 import { getConfig } from "./config";
+import type { TypesafeRole } from "./config";
 import { planModeActive, scanBranch } from "./branch";
 import type { EntryView } from "./branch";
 import { cap, escapeAttr, fmt2 } from "./text";
@@ -21,6 +22,24 @@ const SEVERITY_LEVELS = [
 	"Concern: material risk, missed constraint, or likely wrong direction",
 	"Blocker: continuing will waste work or produce a broken result",
 ] as const;
+
+// Native advisor's own severity vocabulary (verbatim from omp://advisor-watchdog.md's `advise`
+// tool table), used for the advisory role so both roles map onto the same delivery table.
+const ADVISORY_SEVERITY_LEVELS = [
+	"Nothing to add",
+	"Nit: cleanup, simplification, or a low-risk edge case",
+	"Concern: material risk, likely wrong direction, missing constraint, or hallucinated API",
+	"Blocker: continuing would clearly waste work or produce broken output",
+] as const;
+
+const ADVISORY_THEMES: Record<string, string> = {
+	none: "Nothing notable",
+	verify_first: "A cheap check would raise confidence before continuing",
+	simplify: "A materially simpler approach exists",
+	update_callers: "Another file, caller, test, or doc needs a matching change",
+	clarify_with_user: "Worth confirming an ambiguity with the user",
+	consider_requirement: "A requirement or constraint has not yet been considered",
+};
 
 interface NoulDef {
 	id: string;
@@ -102,11 +121,54 @@ const SHARED_NOULS: Record<string, NoulDef> = {
 		whenTrue: "The task was narrowed or requested work was skipped without saying so.",
 		whenFalse: "The requested scope was preserved or the change was stated.",
 	},
+	worth_checking: {
+		id: "worth_checking",
+		instructions: "A cheap check (reading a file, running a test, grepping for callers) would raise confidence in this step and has not been done yet.",
+		whenTrue: "A cheap check would raise confidence in this step and has not been done.",
+		whenFalse: "The step is already backed by an adequate check, or none is needed.",
+	},
+	simpler_alternative: {
+		id: "simpler_alternative",
+		instructions: "A materially simpler approach to this step exists and would satisfy the user's task equally well.",
+		whenTrue: "A materially simpler approach exists that would satisfy the task equally well.",
+		whenFalse: "No materially simpler approach exists.",
+	},
+	related_update_needed: {
+		id: "related_update_needed",
+		instructions: "Another file, caller, test, or doc will need a matching change for this step to be complete.",
+		whenTrue: "Another file, caller, test, or doc will need a matching change for this step to be complete.",
+		whenFalse: "No related file, caller, test, or doc needs a matching change.",
+	},
+	should_clarify: {
+		id: "should_clarify",
+		instructions: "The task has an ambiguity that is worth confirming with the user before more work builds on the current interpretation.",
+		whenTrue: "The task has an ambiguity worth confirming with the user before more work builds on it.",
+		whenFalse: "The task is unambiguous enough to proceed without confirming.",
+	},
+	missing_consideration: {
+		id: "missing_consideration",
+		instructions: "A relevant requirement, edge case, or constraint from the task has not yet been considered.",
+		whenTrue: "A relevant requirement, edge case, or constraint has not yet been considered.",
+		whenFalse: "All relevant requirements, edge cases, and constraints have been considered.",
+	},
+	on_track: {
+		id: "on_track",
+		instructions: "The current step is a sound, direct move toward the user's stated task.",
+		whenTrue: "The current step is a sound, direct move toward the user's stated task.",
+		whenFalse: "The current step is not a sound, direct move toward the user's stated task.",
+	},
 };
 
 const ACTION_NOUL_IDS = ["breaks_contract", "unfounded_assumption", "incomplete_cutover", "not_what_was_asked", "unverified_claim", "hidden_destruction"];
 const MESSAGE_NOUL_IDS = ["unsupported_claim", "requirement_missed", "risky_api", "weak_verification", "unnecessary_complexity"];
 const TURN_NOUL_IDS = ["requirement_missed", "weak_verification", "unnecessary_complexity", "silent_scope_reduction", "risky_api"];
+
+// Advisory batteries mirror omp's native advisor question shape: on_track is a positive-polarity
+// noul (high value = sound step) and is excluded from severity-escalation bookkeeping below.
+const ADVISORY_ACTION_NOUL_IDS = ["worth_checking", "simpler_alternative", "related_update_needed", "on_track"];
+const ADVISORY_MESSAGE_NOUL_IDS = ["should_clarify", "missing_consideration", "simpler_alternative", "on_track"];
+const ADVISORY_TURN_NOUL_IDS = ["missing_consideration", "related_update_needed", "simpler_alternative", "should_clarify", "on_track"];
+const ON_TRACK_SUPPRESS_FLOOR = 0.75;
 
 const ACTION_DEFECTS: Record<string, string> = {
 	none: "Routine, sound action",
@@ -171,6 +233,7 @@ export interface ReviewOutcome {
 export interface ReviewRecord {
 	ts: string;
 	kind: ReviewKind;
+	role: TypesafeRole;
 	toolCallId?: string;
 	severity: Severity | "none";
 	decision: ReviewOutcome["decision"];
@@ -244,6 +307,27 @@ export function endTurn(): void {
 	if (immuneRemaining > 0) immuneRemaining -= 1;
 }
 
+/**
+ * Shared emission guard over the note-history ring: true when a note with this
+ * semantic key has not been emitted before at an equal or higher severity.
+ * Records the key on success, so callers must only call it when about to emit.
+ * Used by the reviewer's own dedupe and by the ambiguity gate (key `gate|<dim>`).
+ */
+export function shouldEmit(key: string, sev: number): boolean {
+	const priorHighest = noteHistory
+		.filter((h) => h.key === key)
+		.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
+	if (priorHighest !== null && priorHighest >= sev) return false;
+	noteHistory.push({ key, sev });
+	if (noteHistory.length > NOTE_HISTORY_CAP) noteHistory.shift();
+	return true;
+}
+
+/** True while a recent steer's immunity window is still open. */
+export function isSteerImmune(): boolean {
+	return immuneRemaining > 0;
+}
+
 export function getReviewHistory(): ReviewRecord[] {
 	return [...ringBuffer];
 }
@@ -273,8 +357,30 @@ function noulQuestions(ids: string[]) {
 	return questions;
 }
 
-/** Build the full question battery for a review kind. */
-export function buildBattery(kind: ReviewKind) {
+export interface Battery {
+	questions: Record<string, unknown>;
+	/** All noul ids in the battery, including on_track for advisory (used to build the state). */
+	noulIds: string[];
+	/** noulIds minus on_track — the ids that participate in severity/fired escalation. */
+	escalationNoulIds: string[];
+	/** "theme" for advisory, "defect_class" for adversarial — the choice question's id. */
+	defectKey: "defect_class" | "theme";
+	severityLevels: readonly string[];
+}
+
+/** Build the full question battery for a review kind and role. */
+export function buildBattery(kind: ReviewKind, role: TypesafeRole = "adversarial"): Battery {
+	if (role === "advisory") {
+		const noulIds =
+			kind === "action" ? ADVISORY_ACTION_NOUL_IDS : kind === "message" ? ADVISORY_MESSAGE_NOUL_IDS : ADVISORY_TURN_NOUL_IDS;
+		const escalationNoulIds = noulIds.filter((id) => id !== "on_track");
+		const questions = {
+			...noulQuestions(noulIds),
+			severity: score(SEVERITY_INSTRUCTION[kind], [...ADVISORY_SEVERITY_LEVELS]),
+			theme: choice("Which best describes what's worth raising, if anything?", ADVISORY_THEMES),
+		};
+		return { questions, noulIds, escalationNoulIds, defectKey: "theme", severityLevels: ADVISORY_SEVERITY_LEVELS };
+	}
 	const noulIds = kind === "action" ? ACTION_NOUL_IDS : kind === "message" ? MESSAGE_NOUL_IDS : TURN_NOUL_IDS;
 	const defectCriteria = kind === "action" ? ACTION_DEFECTS : EXTENDED_DEFECTS;
 	const questions = {
@@ -282,7 +388,7 @@ export function buildBattery(kind: ReviewKind) {
 		severity: score(SEVERITY_INSTRUCTION[kind], [...SEVERITY_LEVELS]),
 		defect_class: choice("Which best describes the defect, if any?", defectCriteria),
 	};
-	return { questions, noulIds };
+	return { questions, noulIds, escalationNoulIds: noulIds, defectKey: "defect_class", severityLevels: SEVERITY_LEVELS };
 }
 
 // ---- severity + guard ----------------------------------------------------------
@@ -328,6 +434,26 @@ function buildNote(kind: ReviewKind, severity: Severity, defect: string, fired: 
 	return `<adversarial-note ${attrs.join(" ")}>\n${claim} Verify or refute before building on this.\n</adversarial-note>`;
 }
 
+/** Advisory role's note — mirrors omp's native `<advisory>` element shape exactly. */
+function buildAdvisoryNote(kind: ReviewKind, severity: Severity, theme: string, fired: { id: string; value: number }[], confidence: number | null, evidenceText: string | undefined): string {
+	const attrs: string[] = [
+		'advisor="TypeSafe"',
+		`severity="${severity}"`,
+		'guidance="weigh, don\'t blindly obey"',
+		`theme="${escapeAttr(theme)}"`,
+	];
+	for (const f of fired) attrs.push(`${f.id}="${fmt2(f.value)}"`);
+	if (confidence !== null) attrs.push(`confidence="${fmt2(confidence)}"`);
+	if (evidenceText) attrs.push(`evidence="${escapeAttr(evidenceText)}"`);
+	const firedNames = fired.map((f) => f.id).join(", ");
+	const top = fired.reduce<{ id: string; value: number } | null>((acc, f) => (acc === null || f.value > acc.value ? f : acc), null);
+	const topDef = top ? SHARED_NOULS[top.id] : undefined;
+	const claim = topDef
+		? `${topDef.whenTrue} (${top!.id}).`
+		: `TypeSafe advisory review of the last ${KIND_NOUN[kind]} raises ${theme}${firedNames ? ` (${firedNames})` : ""}.`;
+	return `<advisory ${attrs.join(" ")}>\n${claim} Consider this before continuing.\n</advisory>`;
+}
+
 function routeDelivery(kind: ReviewKind, severity: Severity, entries: EntryView[], ctx: CtxLike): { channel: "aside" | "steer" | "nextTurn"; triggerTurn: boolean; immuneDowngrade: boolean } {
 	let channel: "aside" | "steer" | "nextTurn";
 	let triggerTurn = false;
@@ -366,7 +492,7 @@ export interface ReviewOpts {
  * Run one review: build the battery, ask Jev, derive severity, guard, deliver.
  * Never throws; all outcomes are recorded in the ring buffer.
  */
-export async function review(pi: PiLike, kind: ReviewKind, state: Record<string, unknown>, ctx: CtxLike, opts: ReviewOpts = {}): Promise<ReviewOutcome> {
+export async function review(pi: PiLike, kind: ReviewKind, state: Record<string, unknown>, ctx: CtxLike, opts: ReviewOpts = {}, role: TypesafeRole = "adversarial"): Promise<ReviewOutcome> {
 	const cfg = getConfig().adversary;
 	const toolCallId = opts.toolCallId;
 	const stateSummary: Record<string, string> = {};
@@ -374,7 +500,7 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 		if (typeof value === "string") stateSummary[key] = `${value.length} chars`;
 		else stateSummary[key] = cap(JSON.stringify(value) ?? "object", 80);
 	}
-	const blank = { stateSummary, ...(toolCallId ? { toolCallId } : {}) };
+	const blank = { stateSummary, role, ...(toolCallId ? { toolCallId } : {}) };
 	let nonBlockerEmittedThisUpdate = 0;
 	try {
 		if (!apiKeyPresent()) {
@@ -387,8 +513,8 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			record(pi, kind, { severity: "none", decision: "suppressed", reason: "call_budget", ...blank }, { inputTokens: 0, outputTokens: 0 });
 			return { severity: "none", decision: "suppressed", reason: "call_budget" };
 		}
-		const { questions, noulIds } = buildBattery(kind);
-		const { result } = await ask(state, questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
+		const battery = buildBattery(kind, role);
+		const { result } = await ask(state, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
 		const usage = { inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0 };
 		const answers = result.answers ?? {};
 		const severityAnswer = answers.severity as WireAnswer | undefined;
@@ -397,19 +523,26 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			sevScore >= cfg.blocker_severity ? "blocker" : sevScore >= cfg.concern_severity ? "concern" : "pending";
 		let maxNoul = 0;
 		const fired: { id: string; value: number }[] = [];
-		for (const id of noulIds) {
+		for (const id of battery.escalationNoulIds) {
 			const value = extractNoul(answers[id] as WireAnswer | undefined) ?? 0;
 			if (value > maxNoul) maxNoul = value;
 			if (value >= cfg.noul_floor) fired.push({ id, value });
 		}
-		const finalSeverity: Severity | "none" = severity === "pending" ? (maxNoul >= cfg.noul_floor ? "nit" : "none") : severity;
-		const defectAnswer = answers.defect_class as WireAnswer | undefined;
+		let finalSeverity: Severity | "none" = severity === "pending" ? (maxNoul >= cfg.noul_floor ? "nit" : "none") : severity;
+		const defectAnswer = answers[battery.defectKey] as WireAnswer | undefined;
 		const rawDefect = typeof defectAnswer?.choice === "string" ? defectAnswer.choice : "unclassified";
 		const defectConfidence = numField(defectAnswer, "confidence");
 		const defect = rawDefect !== "none" && defectConfidence !== null && defectConfidence >= 0.5 ? rawDefect : "unclassified";
 		const severityConfidence = numField(severityAnswer, "confidence");
 		const scores: Record<string, number> = { severity: sevScore };
 		for (const f of fired) scores[f.id] = f.value;
+
+		// Advisory-only: a step the reviewer agrees is sound suppresses anything below a blocker.
+		if (role === "advisory" && finalSeverity !== "none" && finalSeverity !== "blocker") {
+			const onTrack = extractNoul(answers.on_track as WireAnswer | undefined) ?? 0;
+			scores.on_track = onTrack;
+			if (onTrack >= ON_TRACK_SUPPRESS_FLOOR) finalSeverity = "none";
+		}
 
 		if (finalSeverity === "none") {
 			record(pi, kind, { severity: "none", decision: "none", scores, defect, ...blank }, usage);
@@ -422,7 +555,10 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 		}
 
 		const evidenceAttr = opts.evidence ? formatEvidenceAttribute(opts.evidence) : undefined;
-		const note = buildNote(kind, finalSeverity, defect, fired, severityConfidence, evidenceAttr);
+		const note =
+			role === "advisory"
+				? buildAdvisoryNote(kind, finalSeverity, defect, fired, severityConfidence, evidenceAttr)
+				: buildNote(kind, finalSeverity, defect, fired, severityConfidence, evidenceAttr);
 
 		const norm = normalizeNote(note);
 		if (CONTENT_FREE_NOTES.has(norm) || norm.length < 20) {
@@ -458,7 +594,7 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 
 		const options: Record<string, unknown> = { deliverAs: routed.channel };
 		if (routed.triggerTurn) options.triggerTurn = true;
-		await pi.sendMessage({ customType: "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
+		await pi.sendMessage({ customType: role === "advisory" ? "ai.typesafe.advisory" : "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
 		if (finalSeverity !== "blocker") nonBlockerEmittedThisUpdate += 1;
 		stats.delivered[finalSeverity] += 1;
 		if (routed.channel === "steer") {

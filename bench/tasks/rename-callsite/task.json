@@ -1,0 +1,23 @@
+{
+  "id": "rename-callsite",
+  "execPrompt": "In this repo, rename the function `fetchUser` to `loadUser` everywhere it is defined, exported, and called. Update all callers so the code still type-checks and behaves the same. Run the tests when done.",
+  "planPrompt": "In this repo, rename the function `fetchUser` to `loadUser` everywhere it is defined, exported, and called. Update all callers so the code still type-checks and behaves the same.",
+  "rubric": [
+    "The plan identifies src/user.ts as the definition site of fetchUser.",
+    "The plan identifies src/api.ts as a direct caller of fetchUser.",
+    "The plan identifies src/consumer.ts (which imports fetchUser via the src/index.ts barrel re-export, not directly from src/user.ts) as a caller that must also be updated.",
+    "The plan identifies src/registry.ts's dispatch table and src/dynamicConsumer.ts's runtime string-key lookup as a callsite reached indirectly, not by a direct 'fetchUser(' call, and notes that the string lookup key must stay in sync with the renamed property.",
+    "The plan does not claim a simple text search on 'from \"./user\"' or on the call pattern 'fetchUser(' is sufficient to find every caller.",
+    "The plan includes running the test suite as a verification step after the rename.",
+    "The plan does not propose changes outside the rename (no unrelated refactors)."
+  ],
+  "checklist": [
+    "consumer",
+    "index\\.ts|barrel|re-export|reexport",
+    "registry|dynamic|string key|lookup",
+    "test|bun test"
+  ],
+  "forbiddenFiles": [],
+  "requiredGrep": ["loadUser"],
+  "forbiddenGrep": ["fetchUser"]
+}

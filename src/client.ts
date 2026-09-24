@@ -69,7 +69,13 @@ export function getLastApi(): string | null {
 }
 
 export function resolveJudgeModel(ctx: JudgeContext, modelOverride?: string) {
-	return ctx.models.resolve(modelOverride ?? "@judge");
+	const resolved = ctx.models.resolve(modelOverride ?? "@judge");
+	if (resolved) return resolved;
+	const nativeJudges = ctx.modelRegistry.getAvailable("judge").filter((model) => model.api === "openrouter-decisions" || model.api === "typesafe");
+	if (modelOverride) {
+		return nativeJudges.find((model) => `${model.provider}/${model.id}` === modelOverride || model.id === modelOverride);
+	}
+	return nativeJudges.length === 1 ? nativeJudges[0] : undefined;
 }
 
 export function judgeAvailable(ctx: JudgeContext, modelOverride?: string): boolean {

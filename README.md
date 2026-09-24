@@ -137,7 +137,7 @@ modelRoles:
 ```
 
 Configure OpenRouter credentials in omp as usual. No `TYPESAFE_API_KEY` is needed; the extension uses the model
-and credential resolved by omp for `@judge`. It makes native judgment requests to OpenRouter's decisions API.
+and credential resolved by omp for `@judge`. On OMP versions whose extension resolver excludes `kind: judge` from `@judge`, the plugin uses the sole authenticated native judge candidate; if more than one exists, set `typesafe_ask`'s optional `model` override or upgrade the OMP role resolver. It makes native judgment requests to OpenRouter's decisions API.
 
 Install the maintained fork/branch after publishing it:
 

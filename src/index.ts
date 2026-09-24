@@ -596,8 +596,13 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				}
 				const { result, requestId } = await ask(_ctx, JSON.parse(JSON.stringify(state)) as JudgmentState, built.questions, { timeoutMs: 10000, model: params.model });
 				return {
-					content: [{ type: "text", text: summarizeAnswers(result.answers) }],
-					details: { model: result.model, answers: result.answers, usage: result.usage, requestId },
+					content: [
+						{
+							type: "text",
+							text: `${summarizeAnswers(result.answers)}\nmodel=${result.provider}/${result.model} api=${result.api} usage in=${result.usage.input_tokens} out=${result.usage.output_tokens} cost=$${result.usage.cost.toFixed(8)}`,
+						},
+					],
+					details: { model: result.model, api: result.api, provider: result.provider, answers: result.answers, usage: result.usage, requestId },
 				};
 			} catch (err) {
 				return {

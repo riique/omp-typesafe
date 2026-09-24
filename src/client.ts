@@ -1,11 +1,21 @@
 import { TypeSafeJudge } from "@oh-my-pi/pi-ai/judgment";
 import type { ChoiceQuestion, JudgmentState, NoulQuestion, Questions, ScoreQuestion } from "@oh-my-pi/pi-ai/judgment";
+import { Settings } from "@oh-my-pi/pi-coding-agent";
 import type { ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 
 /** Shared extension host surface needed to resolve the native judge role. */
 type JudgeHostContext = ExtensionContext | ExtensionCommandContext;
 
-export type JudgeContext = Pick<JudgeHostContext, "models" | "modelRegistry" | "sessionManager">;
+export type JudgeContext = Pick<JudgeHostContext, "cwd" | "models" | "modelRegistry" | "sessionManager">;
+
+const sessionSettings = new Map<string, Settings>();
+
+export async function loadJudgeRole(cwd: string): Promise<string | undefined> {
+	const settings = await Settings.loadReadOnly({ cwd });
+	sessionSettings.set(cwd, settings);
+	return settings.getModelRole("judge");
+}
 
 export interface SessionUsage {
 	inputTokens: number;
@@ -69,13 +79,11 @@ export function getLastApi(): string | null {
 }
 
 export function resolveJudgeModel(ctx: JudgeContext, modelOverride?: string) {
-	const resolved = ctx.models.resolve(modelOverride ?? "@judge");
-	if (resolved) return resolved;
-	const nativeJudges = ctx.modelRegistry.getAvailable("judge").filter((model) => model.api === "openrouter-decisions" || model.api === "typesafe");
-	if (modelOverride) {
-		return nativeJudges.find((model) => `${model.provider}/${model.id}` === modelOverride || model.id === modelOverride);
-	}
-	return nativeJudges.length === 1 ? nativeJudges[0] : undefined;
+	const settings = sessionSettings.get(ctx.cwd);
+	if (!settings) return undefined;
+	const selector = modelOverride ?? settings.getModelRole("judge");
+	if (!selector) return undefined;
+	return resolveModelRoleValue(selector, ctx.modelRegistry.getAvailable("all"), { settings }).model;
 }
 
 export function judgeAvailable(ctx: JudgeContext, modelOverride?: string): boolean {

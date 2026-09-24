@@ -4,6 +4,7 @@ import type { JudgmentState, Questions } from "@oh-my-pi/pi-ai/judgment";
 import type { JudgeContext } from "./client";
 import {
 	getLastApi,
+	loadJudgeRole,
 	judgeAvailable,
 	resolveJudgeModel,
 	ask,
@@ -236,6 +237,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await loadConfig(logger);
+		const judgeRole = await loadJudgeRole(ctx.cwd);
 		sessionOverride = null;
 		sessionRoleOverride = null;
 		priorities = await loadPriorities(ctx.cwd, resolvedRole());
@@ -251,8 +253,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		turnCursor = ctx.sessionManager.getBranch().length;
 		pi.setLabel(roleLabel(resolvedRole()));
 		if (!judgeAvailable(ctx)) {
-			logger?.warn?.("[typesafe] no native judgment model resolves from @judge; configure modelRoles.judge");
-			notifyVia(ctx, logger, "TypeSafe adversary inactive: configure a native judgment model in modelRoles.judge", "warn");
+			logger?.warn?.(`[typesafe] configured judge role does not resolve to a native judgment model: ${judgeRole ?? "unset"}`);
+			notifyVia(ctx, logger, `TypeSafe adversary inactive: judge role ${judgeRole ?? "is unset or unavailable"}`, "warn");
 		}
 	});
 

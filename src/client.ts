@@ -1,76 +1,27 @@
-import {
-	APIConnectionError,
-	APIError,
-	APIUserAbortError,
-	APITimeoutError,
-	RateLimitError,
-	TypeSafeClient,
-	TypeSafeError,
-	choice,
-	noul,
-	score,
-} from "@typesafe-ai/sdk";
-import type { EntryType, Questions } from "@typesafe-ai/sdk";
+import { TypeSafeJudge } from "@oh-my-pi/pi-ai/judgment";
+import type { ChoiceQuestion, JudgmentState, NoulQuestion, Questions, ScoreQuestion } from "@oh-my-pi/pi-ai/judgment";
+import type { ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 
-/**
- * SDK wrapper. All TypeSafe traffic goes through here so usage tracking,
- * model resolution and error classification stay in one place.
- */
+/** Shared extension host surface needed to resolve the native judge role. */
+type JudgeHostContext = ExtensionContext | ExtensionCommandContext;
 
-let client: TypeSafeClient | null = null;
+export type JudgeContext = Pick<JudgeHostContext, "models" | "modelRegistry" | "sessionManager">;
 
 export interface SessionUsage {
 	inputTokens: number;
 	outputTokens: number;
 	requests: number;
+	costUsd: number;
 }
 
-const usage: SessionUsage = { inputTokens: 0, outputTokens: 0, requests: 0 };
+const usage: SessionUsage = { inputTokens: 0, outputTokens: 0, requests: 0, costUsd: 0 };
 let lastResolvedModel: string | null = null;
-
-/** Per-request pricing: $0.042 per Mtok input, output free. */
-const INPUT_USD_PER_MTOK = 0.042;
-
-export function apiKeyPresent(): boolean {
-	return !!process.env.TYPESAFE_API_KEY?.trim();
-}
-
-export function getClient(model?: string): TypeSafeClient {
-	if (!client) {
-		client = new TypeSafeClient(model ? { defaultModel: model } : {});
-	}
-	return client;
-}
-
-export function resetClient(): void {
-	client = null;
-	lastResolvedModel = null;
-}
-
-export function getSessionUsage(): SessionUsage {
-	return { ...usage };
-}
-
-export function resetUsage(): void {
-	usage.inputTokens = 0;
-	usage.outputTokens = 0;
-	usage.requests = 0;
-}
-
-export function estimateCostUsd(): number {
-	return (usage.inputTokens * INPUT_USD_PER_MTOK) / 1_000_000;
-}
-
-export function getLastResolvedModel(): string | null {
-	return lastResolvedModel;
-}
+let lastApi: string | null = null;
 
 export interface AskOptions {
-	/** Per-attempt timeout in ms. SDK default is 10000. */
 	timeoutMs?: number;
-	maxRetries?: number;
-	/** Model override; usually omitted so the client default applies. */
 	model?: string;
+	signal?: AbortSignal;
 }
 
 export interface WireAnswer {
@@ -81,67 +32,110 @@ export interface WireAnswer {
 export interface AskResult {
 	result: {
 		model: string;
+		api: string;
+		provider: string;
 		answers: Record<string, WireAnswer>;
-		usage: { input_tokens: number; output_tokens: number };
+		usage: { input_tokens: number; output_tokens: number; cost: number };
 	};
-	requestId: string | undefined;
+	requestId: undefined;
 }
 
-/**
- * One systemOne call. `state` may be a string, object, or array.
- * Timeouts are per attempt; `signal` is a belt-and-braces total budget.
- */
-export async function ask(
-	state: EntryType,
-	questions: Questions,
-	opts: AskOptions = {},
-): Promise<AskResult> {
-	const timeoutMs = opts.timeoutMs ?? 10_000;
-	const maxRetries = opts.maxRetries ?? 0;
-	const c = getClient(opts.model);
-	const promise = c.systemOne(
-		{ state, questions, ...(opts.model ? { model: opts.model } : {}) },
-		{
-			timeout: timeoutMs,
-			retry: { maxRetries },
-			signal: AbortSignal.timeout(timeoutMs + 300),
-		},
-	);
-	const wrapped = await promise.withResponse();
-	const data = wrapped.data;
-	usage.inputTokens += data.usage?.input_tokens ?? 0;
-	usage.outputTokens += data.usage?.output_tokens ?? 0;
-	usage.requests += 1;
-	lastResolvedModel = data.model ?? null;
-	const answers: Record<string, WireAnswer> = {};
-	for (const [name, answer] of Object.entries(data.answers)) {
-		// Spread into a fresh object literal so the answer fits the index signature.
-		answers[name] = { ...answer };
+export function resetClient(): void {
+	lastResolvedModel = null;
+	lastApi = null;
+}
+
+export function resetUsage(): void {
+	usage.inputTokens = 0;
+	usage.outputTokens = 0;
+	usage.requests = 0;
+	usage.costUsd = 0;
+}
+
+export function getSessionUsage(): SessionUsage {
+	return { ...usage };
+}
+
+export function estimateCostUsd(): number {
+	return usage.costUsd;
+}
+
+export function getLastResolvedModel(): string | null {
+	return lastResolvedModel;
+}
+
+export function getLastApi(): string | null {
+	return lastApi;
+}
+
+export function resolveJudgeModel(ctx: JudgeContext, modelOverride?: string) {
+	return ctx.models.resolve(modelOverride ?? "@judge");
+}
+
+export function judgeAvailable(ctx: JudgeContext, modelOverride?: string): boolean {
+	const model = resolveJudgeModel(ctx, modelOverride);
+	return model !== undefined && model.api === "openrouter-decisions";
+}
+
+export async function ask(ctx: JudgeContext, state: JudgmentState, questions: Questions, opts: AskOptions = {}): Promise<AskResult> {
+	const model = resolveJudgeModel(ctx, opts.model);
+	if (!model) throw new Error(opts.model ? `judge model not found: ${opts.model}` : "no model resolves for @judge");
+	if (model.api !== "openrouter-decisions" && model.api !== "typesafe") {
+		throw new Error(`judge model ${model.provider}/${model.id} does not support native judgments (api=${model.api})`);
 	}
+	const apiKey = ctx.modelRegistry.resolver(model, ctx.sessionManager.getSessionId());
+	const headers = await ctx.modelRegistry.resolveModelHeaders(model, opts.signal);
+	const judge = new TypeSafeJudge({
+		apiKey,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		baseUrl: model.baseUrl,
+		headers,
+		timeoutMs: opts.timeoutMs,
+	});
+	const result = await judge.judge({ state, questions }, { signal: opts.signal });
+	usage.inputTokens += result.usage.input;
+	usage.outputTokens += result.usage.output;
+	usage.requests += 1;
+	usage.costUsd += result.usage.cost.total;
+	lastResolvedModel = `${result.provider}/${result.model}`;
+	lastApi = result.api;
+	const answers: Record<string, WireAnswer> = {};
+	for (const [name, answer] of Object.entries(result.answers)) answers[name] = { ...answer };
 	return {
 		result: {
-			model: data.model,
+			model: result.model,
+			api: result.api,
+			provider: result.provider,
 			answers,
-			usage: { input_tokens: data.usage?.input_tokens ?? 0, output_tokens: data.usage?.output_tokens ?? 0 },
+			usage: {
+				input_tokens: result.usage.input,
+				output_tokens: result.usage.output,
+				cost: result.usage.cost.total,
+			},
 		},
-		requestId: wrapped.requestId,
+		requestId: undefined,
 	};
 }
 
-/** Human-readable classification of an SDK failure. */
 export function describeError(err: unknown): string {
-	if (err instanceof APITimeoutError) return "timeout";
-	if (err instanceof RateLimitError) {
-		return err.retryAfterMs !== undefined ? `rate_limited retryAfter=${err.retryAfterMs}ms` : "rate_limited";
-	}
-	if (err instanceof APIUserAbortError) return "aborted";
-	if (err instanceof APIConnectionError) return "connection_error";
-	if (err instanceof APIError) {
-		const reqId = err.requestId !== undefined ? ` request=${err.requestId}` : "";
-		return `api_error status=${err.status}${reqId}: ${err.message}`;
-	}
-	if (err instanceof TypeSafeError) return `typesafe_error: ${err.message}`;
 	return err instanceof Error ? err.message : String(err);
 }
 
-export { choice, noul, score };
+export function noul(instructions: string, criteria?: { true?: string; false?: string }): NoulQuestion {
+	return { type: "noul", instructions, criteria };
+}
+
+export function choice(instructions: string, criteria: Record<string, string>): ChoiceQuestion {
+	return {
+		type: "choice",
+		instructions,
+		criteria: Object.fromEntries(Object.entries(criteria).map(([key, value]) => [key, value])),
+	};
+}
+
+export function score(instructions: string, levels: readonly string[]): ScoreQuestion {
+	if (levels.length < 2) throw new Error("score requires at least two levels");
+	return { type: "score", instructions, criteria: levels as [string, string, ...string[]] };
+}

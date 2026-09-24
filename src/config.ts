@@ -45,7 +45,6 @@ export type TypesafeRole = "adversarial" | "advisory";
 export type TypesafePhase = "plan" | "execute";
 
 export interface TypesafeConfig {
-	model: string;
 	role: TypesafeRole;
 	phases: TypesafePhase[];
 	adversary: AdversarySettings;
@@ -54,7 +53,6 @@ export interface TypesafeConfig {
 }
 
 export const DEFAULT_CONFIG: TypesafeConfig = {
-	model: "jev-latest",
 	role: "adversarial",
 	phases: ["plan", "execute"],
 	adversary: {
@@ -171,7 +169,6 @@ export function mergeConfig(base: TypesafeConfig, override: unknown): TypesafeCo
 	const g = base.stopGate;
 	const ag = base.ambiguityGate;
 	return {
-		model: typeof o.model === "string" && o.model.trim() ? o.model.trim() : base.model,
 		role: roleVal(o.role, base.role),
 		phases: phasesArr(o.phases, base.phases),
 		adversary: {

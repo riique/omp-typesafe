@@ -1,4 +1,6 @@
 import { ask, choice, noul, score } from "./client";
+import type { JudgeContext } from "./client";
+import type { JudgmentState, Questions } from "@oh-my-pi/pi-ai/judgment";
 import type { WireAnswer } from "./client";
 import type { AmbiguityGateSettings } from "./config";
 import { cap, isRecord } from "./text";
@@ -118,22 +120,16 @@ const GAP_OPTIONS: Record<Dimension, Record<string, string>> = {
 	},
 };
 
-export function buildAmbiguityBattery(): Record<string, unknown> {
-	const questions: Record<string, unknown> = {};
+export function buildAmbiguityBattery(): Questions {
+	const questions: Questions = {};
 	for (const dim of DIMENSIONS) {
 		questions[`${dim}_clarity`] = score(SCORE_INSTRUCTIONS[dim], [...SCORE_LEVELS[dim]]);
-		questions[`gap_${dim}`] = choice(
-			`Which piece is most likely missing from the ${DIMENSION_LABEL[dim]} of this task?`,
-			GAP_OPTIONS[dim],
-		);
+		questions[`gap_${dim}`] = choice(`Which piece is most likely missing from the ${DIMENSION_LABEL[dim]} of this task?`, GAP_OPTIONS[dim]);
 	}
-	questions.user_can_answer = noul(
-		"The remaining ambiguity is a product or preference decision the user must make, not something the agent could resolve by reading the code.",
-		{
-			true: "Only the user can settle what remains; reading more code would not resolve it.",
-			false: "The agent could resolve what remains by reading or running something.",
-		},
-	);
+	questions.user_can_answer = noul("The remaining ambiguity is a product or preference decision the user must make, not something the agent could resolve by reading the code.", {
+		true: "Only the user can settle what remains; reading more code would not resolve it.",
+		false: "The agent could resolve what remains by reading or running something.",
+	});
 	return questions;
 }
 
@@ -169,7 +165,8 @@ function clamp01(value: number): number {
 
 // ---- question drafting ---------------------------------------------------------
 
-const VERB = /\b(add|build|create|implement|rename|refactor|fix|update|remove|delete|support|migrate|change|make)\s+(?:the\s+|a\s+|an\s+)?([A-Za-z0-9_.\-/]+(?:\s+[A-Za-z0-9_.\-/]+)?)/i;
+const VERB =
+	/\b(add|build|create|implement|rename|refactor|fix|update|remove|delete|support|migrate|change|make)\s+(?:the\s+|a\s+|an\s+)?([A-Za-z0-9_.\-/]+(?:\s+[A-Za-z0-9_.\-/]+)?)/i;
 
 /** First noun-ish phrase after an action verb in the task text; "this change" when none. */
 export function taskEntity(task: string): string {
@@ -302,15 +299,11 @@ function num(answer: WireAnswer | undefined, key: string): number | null {
  * One Jev call producing the composite score. Returns null on any failure so
  * callers treat it as decision "none" and never block on an API problem.
  */
-export async function scoreAmbiguity(
-	_pi: AskerLike,
-	state: AmbiguityState,
-	cfg: AmbiguityGateSettings,
-): Promise<AmbiguityResult | null> {
+export async function scoreAmbiguity(_pi: AskerLike, state: AmbiguityState, cfg: AmbiguityGateSettings, ctx: JudgeContext): Promise<AmbiguityResult | null> {
 	try {
-		const { result } = await ask(state as unknown as Record<string, unknown>, buildAmbiguityBattery(), {
+		const judgmentState = JSON.parse(JSON.stringify(state)) as JudgmentState;
+		const { result } = await ask(ctx, judgmentState, buildAmbiguityBattery(), {
 			timeoutMs: cfg.timeoutMs,
-			maxRetries: 0,
 		});
 		const answers = result.answers ?? {};
 		const dims = {} as Record<Dimension, number>;
@@ -359,11 +352,7 @@ export function buildGateNote(result: AmbiguityResult, threshold: number): strin
  * Propose-gate decision: block only with a UI (headless omp has no `ask` tool,
  * so the intent is recorded as would_block and the plan is let through).
  */
-export function proposeDecision(
-	result: Pick<AmbiguityResult, "ambiguity" | "userCanAnswer">,
-	cfg: AmbiguityGateSettings,
-	hasUI: boolean,
-): GateDecision {
+export function proposeDecision(result: Pick<AmbiguityResult, "ambiguity" | "userCanAnswer">, cfg: AmbiguityGateSettings, hasUI: boolean): GateDecision {
 	if (!cfg.blockPropose) return "none";
 	if (result.ambiguity <= cfg.threshold) return "none";
 	if (result.userCanAnswer < cfg.userCanAnswerFloor) return "none";

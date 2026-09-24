@@ -1,8 +1,11 @@
 import { homedir } from "node:os";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import type { Questions } from "@typesafe-ai/sdk";
+import type { JudgmentState, Questions } from "@oh-my-pi/pi-ai/judgment";
+import type { JudgeContext } from "./client";
 import {
-	apiKeyPresent,
+	getLastApi,
+	judgeAvailable,
+	resolveJudgeModel,
 	ask,
 	choice,
 	describeError,
@@ -19,7 +22,6 @@ import { getConfig, loadConfig } from "./config";
 import type { TypesafeRole } from "./config";
 import { loadPriorities } from "./priorities";
 import { collectEvidence, recordAction, repoOutline, resetEvidenceTurn } from "./evidence";
-import type { Evidence } from "./evidence";
 import { claimedIntent, lastUserText, planModeActive, priorActions, renderDelta, scanBranch } from "./branch";
 import type { EntryView } from "./branch";
 import {
@@ -150,7 +152,9 @@ function summarizeAnswers(answers: Record<string, WireAnswer>): string {
 						.map(([k, v]) => `${k}=${String(v)}`)
 						.join(" ")
 				: "";
-			lines.push(`${id}.score = ${typeof a.score === "number" ? a.score.toFixed(3) : String(a.score)} (confidence ${conf}${legend ? `; legend ${legend}` : ""}${probs ? `; probabilities ${probs}` : ""})`);
+			lines.push(
+				`${id}.score = ${typeof a.score === "number" ? a.score.toFixed(3) : String(a.score)} (confidence ${conf}${legend ? `; legend ${legend}` : ""}${probs ? `; probabilities ${probs}` : ""})`,
+			);
 		}
 	}
 	return lines.join("\n");
@@ -209,10 +213,10 @@ function buildWireQuestions(items: unknown): { questions?: Questions; error?: st
  * "none" decision and the plan-mode flow continues untouched.
  */
 
-interface GateCtxLike {
-	cwd?: string;
+interface GateCtxLike extends JudgeContext {
+	cwd: string;
 	hasUI?: boolean;
-	sessionManager: { getBranch(): unknown[] };
+	sessionManager: JudgeContext["sessionManager"] & { getBranch(): unknown[] };
 }
 
 /** Assistant text seen so far this plan, plus any plan file content written. */
@@ -246,9 +250,9 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 		planPrompt = "";
 		turnCursor = ctx.sessionManager.getBranch().length;
 		pi.setLabel(roleLabel(resolvedRole()));
-		if (!apiKeyPresent()) {
-			logger?.warn?.("[typesafe] TYPESAFE_API_KEY is not set; adversary and typesafe_ask stay inactive");
-			notifyVia(ctx, logger, "TypeSafe adversary inactive: TYPESAFE_API_KEY not set", "warn");
+		if (!judgeAvailable(ctx)) {
+			logger?.warn?.("[typesafe] no native judgment model resolves from @judge; configure modelRoles.judge");
+			notifyVia(ctx, logger, "TypeSafe adversary inactive: configure a native judgment model in modelRoles.judge", "warn");
 		}
 	});
 
@@ -268,9 +272,9 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	// ---- ambiguity gate ------------------------------------------------------
 
 	/** Gate preconditions: plan mode, enabled, key present, ask budget left. */
-	const gateEligible = (entries: EntryView[]): boolean => {
+	const gateEligible = (entries: EntryView[], ctx: JudgeContext): boolean => {
 		const gcfg = getConfig().ambiguityGate;
-		if (!gcfg.enabled || !apiKeyPresent()) return false;
+		if (!gcfg.enabled || !judgeAvailable(ctx)) return false;
 		if (!planModeActive(entries)) return false;
 		return asksObserved() < gcfg.maxAsksPerPlan;
 	};
@@ -282,13 +286,18 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			const asked = getAsks();
 			const outline = await repoOutline(pi, ctx.cwd);
 			const evidence = await collectEvidence(pi, ctx.cwd);
-			const result = await scoreAmbiguity(pi, {
-				task: cap(task, 4000),
-				plan_so_far: planSoFar(entries),
-				questions_already_asked: asked.map((a) => a.question),
-				answers_received: asked.map((a) => a.answer),
-				evidence: { status: evidence.status ?? "", repo_outline: outline },
-			}, gcfg);
+			const result = await scoreAmbiguity(
+				pi,
+				{
+					task: cap(task, 4000),
+					plan_so_far: planSoFar(entries),
+					questions_already_asked: asked.map((a) => a.question),
+					answers_received: asked.map((a) => a.answer),
+					evidence: { status: evidence.status ?? "", repo_outline: outline },
+				},
+				gcfg,
+				ctx,
+			);
 			return result;
 		} catch (err) {
 			logger?.warn?.(`[typesafe] ambiguity scoring failed (${trigger}): ${describeError(err)}`);
@@ -312,7 +321,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	/** Score and, when the task is still too ambiguous, steer the model to ask. */
 	const steerIfAmbiguous = async (ctx: GateCtxLike, entries: EntryView[], trigger: GateTrigger, task: string): Promise<void> => {
 		try {
-			if (!gateEligible(entries)) return;
+			if (!gateEligible(entries, ctx)) return;
 			const gcfg = getConfig().ambiguityGate;
 			const result = await runGate(ctx, entries, trigger, task);
 			if (!result) return;
@@ -326,7 +335,12 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				return;
 			}
 			await pi.sendMessage(
-				{ customType: GATE_CUSTOM_TYPE, content: buildGateNote(result, gcfg.threshold), display: true, attribution: "agent" },
+				{
+					customType: GATE_CUSTOM_TYPE,
+					content: buildGateNote(result, gcfg.threshold),
+					display: true,
+					attribution: "agent",
+				},
 				{ deliverAs: "aside" },
 			);
 			noteScore(trigger, result, "steer");
@@ -355,7 +369,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			if (toolName !== "write" || !isProposeWrite(event.input)) return;
 			const entries = scanBranch(ctx.sessionManager.getBranch());
 			const gcfg = getConfig().ambiguityGate;
-			if (!gcfg.enabled || !gcfg.blockPropose || !apiKeyPresent() || !planModeActive(entries)) return;
+			if (!gcfg.enabled || !gcfg.blockPropose || !judgeAvailable(ctx) || !planModeActive(entries)) return;
 			// Once the ask budget for this plan is spent, stop gating rather than looping.
 			if (asksObserved() >= gcfg.maxAsksPerPlan) return;
 			const result = await runGate(ctx as GateCtxLike, entries, "propose", planPrompt || lastUserText(entries));
@@ -375,11 +389,15 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 			const entries = scanBranch(ctx.sessionManager.getBranch());
 			const deltaEntries = entries.slice(Math.max(0, Math.min(turnCursor, entries.length)));
 			turnCursor = entries.length;
-			if (reviewEnabled() && cfg.reviewTurns && apiKeyPresent() && deltaEntries.length > 0 && phaseAllowed(entries)) {
+			if (reviewEnabled() && cfg.reviewTurns && judgeAvailable(ctx) && deltaEntries.length > 0 && phaseAllowed(entries)) {
 				const delta = renderDelta(deltaEntries, 6000);
 				if (delta.trim().length > 0) {
 					const evidence = cfg.evidence ? await collectEvidence(pi, ctx.cwd) : undefined;
-					const state: Record<string, unknown> = { task: lastUserText(entries), review_priorities: priorities, delta };
+					const state: Record<string, unknown> = {
+						task: lastUserText(entries),
+						review_priorities: priorities,
+						delta,
+					};
 					if (evidence) state.evidence = evidence;
 					await review(pi, "turn", state, ctx, { evidence }, resolvedRole());
 				}
@@ -395,7 +413,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	pi.on("message_end", async (event, ctx) => {
 		try {
 			const cfg = getConfig().adversary;
-			if (!reviewEnabled() || !cfg.reviewMessages || !apiKeyPresent() || !canReviewMessage()) return;
+			if (!reviewEnabled() || !cfg.reviewMessages || !judgeAvailable(ctx) || !canReviewMessage()) return;
 			const raw = isRecord(event) && "message" in event ? event.message : event;
 			if (!isRecord(raw) || raw.role !== "assistant") return;
 			const text = textFromContent(raw.content, 4000);
@@ -426,7 +444,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				return;
 			}
 			const cfg = getConfig().adversary;
-			if (!reviewEnabled() || !cfg.reviewActions || !apiKeyPresent()) return;
+			if (!reviewEnabled() || !cfg.reviewActions || !judgeAvailable(ctx)) return;
 			if (toolName === "typesafe_ask" || !toolCallId) return;
 			if (!cfg.tools.includes(toolName)) return;
 			if (event.isError === true) return;
@@ -458,7 +476,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 
 	pi.on("session_stop", async (_event, ctx) => {
 		const gate = getConfig().stopGate;
-		if (!gate.enabled || stopGateUses >= 2 || !apiKeyPresent()) return;
+		if (!gate.enabled || stopGateUses >= 2 || !judgeAvailable(ctx)) return;
 		try {
 			const entries = scanBranch(ctx.sessionManager.getBranch());
 			const questions: Questions = {
@@ -476,7 +494,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				review_priorities: priorities,
 				final_assistant_message: claimedIntent(entries, 2000),
 			};
-			const { result } = await ask(state, questions, { timeoutMs: 4000, maxRetries: 0 });
+			const { result } = await ask(ctx, state, questions, { timeoutMs: 4000 });
 			const verified = answerNumber(result.answers.verified, "noul") ?? 1;
 			const leftUnfinished = answerNumber(result.answers.left_unfinished, "noul") ?? 0;
 			const problems: string[] = [];
@@ -505,6 +523,7 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				usage: getSessionUsage(),
 				costUsd: estimateCostUsd(),
 				lastResolvedModel: getLastResolvedModel(),
+				lastApi: getLastApi(),
 				history: getReviewHistory(),
 				ambiguity: getAmbiguityTelemetry(),
 			};
@@ -549,23 +568,40 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 					try {
 						state = JSON.parse(params.state);
 					} catch (err) {
-						return { content: [{ type: "text", text: `typesafe_ask: invalid JSON state: ${String(err)}` }], isError: true };
+						return {
+							content: [{ type: "text", text: `typesafe_ask: invalid JSON state: ${String(err)}` }],
+							isError: true,
+						};
 					}
 				}
 				const built = buildWireQuestions(params.questions);
 				if (built.error || !built.questions) {
-					return { content: [{ type: "text", text: `typesafe_ask: ${built.error ?? "invalid questions"}` }], isError: true };
+					return {
+						content: [{ type: "text", text: `typesafe_ask: ${built.error ?? "invalid questions"}` }],
+						isError: true,
+					};
 				}
-				if (!apiKeyPresent()) {
-					return { content: [{ type: "text", text: "typesafe_ask: TYPESAFE_API_KEY is not set" }], isError: true };
+				if (!judgeAvailable(_ctx, params.model)) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: "typesafe_ask: configure a native judgment model in modelRoles.judge",
+							},
+						],
+						isError: true,
+					};
 				}
-				const { result, requestId } = await ask(state, built.questions, { timeoutMs: 10000, maxRetries: 2, model: params.model });
+				const { result, requestId } = await ask(_ctx, JSON.parse(JSON.stringify(state)) as JudgmentState, built.questions, { timeoutMs: 10000, model: params.model });
 				return {
 					content: [{ type: "text", text: summarizeAnswers(result.answers) }],
 					details: { model: result.model, answers: result.answers, usage: result.usage, requestId },
 				};
 			} catch (err) {
-				return { content: [{ type: "text", text: `typesafe_ask failed: ${describeError(err)}` }], isError: true };
+				return {
+					content: [{ type: "text", text: `typesafe_ask failed: ${describeError(err)}` }],
+					isError: true,
+				};
 			}
 		},
 	});
@@ -573,7 +609,13 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 	pi.registerCommand("adversary", {
 		description: "TypeSafe adversary reviewer: toggle | on | off | status | last | dump | role",
 		handler: async (args, ctx) => {
-			const tokens = typeof args === "string" ? args.trim().split(/\s+/).filter((t) => t.length > 0) : [];
+			const tokens =
+				typeof args === "string"
+					? args
+							.trim()
+							.split(/\s+/)
+							.filter((t) => t.length > 0)
+					: [];
 			const sub = tokens[0] ?? "";
 			const cfg = getConfig();
 			if (sub === "") {
@@ -601,8 +643,8 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				const lines = [
 					`adversary: ${reviewEnabled() ? "enabled" : "disabled"}${sessionOverride !== null ? ` (session override: ${sessionOverride ? "on" : "off"})` : ""}`,
 					`role: ${resolvedRole()}${sessionRoleOverride !== null ? ` (session override: ${sessionRoleOverride})` : ""}; phases: ${cfg.phases.join(",")}`,
-					`model: ${cfg.model}${resolved ? ` (last resolved: ${resolved})` : ""}`,
-					`api key: ${apiKeyPresent() ? "present" : "MISSING"}`,
+					`judge: ${judgeAvailable(ctx) ? "available" : "unavailable"}${resolved ? ` (last resolved: ${resolved})` : ""}`,
+					`model: ${resolveJudgeModel(ctx)?.provider ?? "?"}/${resolveJudgeModel(ctx)?.id ?? "?"}; api: ${getLastApi() ?? resolveJudgeModel(ctx)?.api ?? "?"}`,
 					`notes delivered: nit=${stats.delivered.nit} concern=${stats.delivered.concern} blocker=${stats.delivered.blocker}; downgraded=${stats.downgraded}; steers=${stats.steers}`,
 					`suppressed: ${suppressed || "none"}; errors=${stats.errors}`,
 					`usage: ${usage.requests} requests, ${usage.inputTokens} in / ${usage.outputTokens} out tokens, ~$${estimateCostUsd().toFixed(6)}`,
@@ -636,16 +678,20 @@ export default function typesafeExtension(pi: ExtensionAPI) {
 				notifyVia(ctx, logger, "usage: /typesafe test", "warn");
 				return;
 			}
-			if (!apiKeyPresent()) {
-				notifyVia(ctx, logger, "TYPESAFE_API_KEY is not set", "warn");
+			if (!judgeAvailable(ctx)) {
+				notifyVia(ctx, logger, "No native judgment model resolves from @judge; configure modelRoles.judge", "warn");
 				return;
 			}
 			const started = Date.now();
 			try {
-				const { result } = await ask({ probe: "hello world", note: "typesafe test command" }, { greeting: noul("Is this a greeting?") }, { timeoutMs: 10000, maxRetries: 2 });
+				const { result } = await ask(ctx, { probe: "hello world", note: "omp-typesafe test command" }, { greeting: noul("Is this a greeting?") }, { timeoutMs: 10000 });
 				const ms = Date.now() - started;
 				const greeting = result.answers.greeting;
-				notifyVia(ctx, logger, `noul=${typeof greeting?.noul === "number" ? greeting.noul.toFixed(3) : "?"} model=${result.model} latency=${ms}ms usage in=${result.usage?.input_tokens ?? 0} out=${result.usage?.output_tokens ?? 0}`);
+				notifyVia(
+					ctx,
+					logger,
+					`noul=${typeof greeting?.noul === "number" ? greeting.noul.toFixed(3) : "?"} model=${result.provider}/${result.model} api=${result.api} latency=${ms}ms usage in=${result.usage.input_tokens} out=${result.usage.output_tokens} cost=$${result.usage.cost.toFixed(8)}`,
+				);
 			} catch (err) {
 				notifyVia(ctx, logger, `typesafe test failed: ${describeError(err)}`, "error");
 			}

@@ -1,4 +1,6 @@
-import { apiKeyPresent, ask, describeError, choice, noul, score } from "./client";
+import { ask, describeError, choice, noul, score, judgeAvailable } from "./client";
+import type { JudgeContext } from "./client";
+import type { JudgmentState, Questions } from "@oh-my-pi/pi-ai/judgment";
 import type { WireAnswer } from "./client";
 import { getConfig } from "./config";
 import type { TypesafeRole } from "./config";
@@ -188,7 +190,11 @@ const EXTENDED_DEFECTS: Record<string, string> = {
 
 const SEVERITY_ORDER: Record<Severity, number> = { nit: 0, concern: 1, blocker: 2 };
 
-const KIND_NOUN: Record<ReviewKind, string> = { action: "action", message: "response", turn: "turn" };
+const KIND_NOUN: Record<ReviewKind, string> = {
+	action: "action",
+	message: "response",
+	turn: "turn",
+};
 
 const SEVERITY_INSTRUCTION: Record<ReviewKind, string> = {
 	action: "Rate the most serious defect present in this action.",
@@ -205,11 +211,11 @@ export interface UiLike {
 	notify(message: string, level?: string): unknown;
 }
 
-export interface CtxLike {
+export interface CtxLike extends Partial<JudgeContext> {
 	hasUI?: boolean;
 	ui?: UiLike;
 	isIdle?: () => boolean;
-	sessionManager?: { getBranch?: () => unknown };
+	sessionManager?: JudgeContext["sessionManager"] & { getBranch?: () => unknown };
 }
 
 export interface PiLike {
@@ -314,9 +320,7 @@ export function endTurn(): void {
  * Used by the reviewer's own dedupe and by the ambiguity gate (key `gate|<dim>`).
  */
 export function shouldEmit(key: string, sev: number): boolean {
-	const priorHighest = noteHistory
-		.filter((h) => h.key === key)
-		.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
+	const priorHighest = noteHistory.filter((h) => h.key === key).reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
 	if (priorHighest !== null && priorHighest >= sev) return false;
 	noteHistory.push({ key, sev });
 	if (noteHistory.length > NOTE_HISTORY_CAP) noteHistory.shift();
@@ -348,8 +352,8 @@ export function getReviewStats(): typeof stats {
 
 // ---- batteries -----------------------------------------------------------------
 
-function noulQuestions(ids: string[]) {
-	const questions: Record<string, unknown> = {};
+function noulQuestions(ids: string[]): Questions {
+	const questions: Questions = {};
 	for (const id of ids) {
 		const def = SHARED_NOULS[id];
 		questions[id] = noul(def.instructions, { true: def.whenTrue, false: def.whenFalse });
@@ -358,7 +362,7 @@ function noulQuestions(ids: string[]) {
 }
 
 export interface Battery {
-	questions: Record<string, unknown>;
+	questions: Questions;
 	/** All noul ids in the battery, including on_track for advisory (used to build the state). */
 	noulIds: string[];
 	/** noulIds minus on_track — the ids that participate in severity/fired escalation. */
@@ -371,15 +375,20 @@ export interface Battery {
 /** Build the full question battery for a review kind and role. */
 export function buildBattery(kind: ReviewKind, role: TypesafeRole = "adversarial"): Battery {
 	if (role === "advisory") {
-		const noulIds =
-			kind === "action" ? ADVISORY_ACTION_NOUL_IDS : kind === "message" ? ADVISORY_MESSAGE_NOUL_IDS : ADVISORY_TURN_NOUL_IDS;
+		const noulIds = kind === "action" ? ADVISORY_ACTION_NOUL_IDS : kind === "message" ? ADVISORY_MESSAGE_NOUL_IDS : ADVISORY_TURN_NOUL_IDS;
 		const escalationNoulIds = noulIds.filter((id) => id !== "on_track");
 		const questions = {
 			...noulQuestions(noulIds),
 			severity: score(SEVERITY_INSTRUCTION[kind], [...ADVISORY_SEVERITY_LEVELS]),
 			theme: choice("Which best describes what's worth raising, if anything?", ADVISORY_THEMES),
 		};
-		return { questions, noulIds, escalationNoulIds, defectKey: "theme", severityLevels: ADVISORY_SEVERITY_LEVELS };
+		return {
+			questions,
+			noulIds,
+			escalationNoulIds,
+			defectKey: "theme",
+			severityLevels: ADVISORY_SEVERITY_LEVELS,
+		};
 	}
 	const noulIds = kind === "action" ? ACTION_NOUL_IDS : kind === "message" ? MESSAGE_NOUL_IDS : TURN_NOUL_IDS;
 	const defectCriteria = kind === "action" ? ACTION_DEFECTS : EXTENDED_DEFECTS;
@@ -388,13 +397,23 @@ export function buildBattery(kind: ReviewKind, role: TypesafeRole = "adversarial
 		severity: score(SEVERITY_INSTRUCTION[kind], [...SEVERITY_LEVELS]),
 		defect_class: choice("Which best describes the defect, if any?", defectCriteria),
 	};
-	return { questions, noulIds, escalationNoulIds: noulIds, defectKey: "defect_class", severityLevels: SEVERITY_LEVELS };
+	return {
+		questions,
+		noulIds,
+		escalationNoulIds: noulIds,
+		defectKey: "defect_class",
+		severityLevels: SEVERITY_LEVELS,
+	};
 }
 
 // ---- severity + guard ----------------------------------------------------------
 
 function normalizeNote(text: string): string {
-	return text.toLowerCase().normalize("NFKC").replace(/[^a-z0-9]+/g, " ").trim();
+	return text
+		.toLowerCase()
+		.normalize("NFKC")
+		.replace(/[^a-z0-9]+/g, " ")
+		.trim();
 }
 
 function numField(answer: WireAnswer | undefined, key: string): number | null {
@@ -412,7 +431,9 @@ function record(pi: PiLike, kind: ReviewKind, entry: Omit<ReviewRecord, "ts" | "
 	const full: ReviewRecord = { ts: new Date().toISOString(), kind, usage, ...entry };
 	ringBuffer.push(full);
 	if (ringBuffer.length > RING_BUFFER_CAP) ringBuffer.shift();
-	pi.logger?.debug?.(`[typesafe] review kind=${kind} decision=${full.decision} severity=${full.severity}${full.reason ? ` reason=${full.reason}` : ""}${full.channel ? ` channel=${full.channel}` : ""}${full.toolCallId ? ` tool=${full.toolCallId}` : ""}`);
+	pi.logger?.debug?.(
+		`[typesafe] review kind=${kind} decision=${full.decision} severity=${full.severity}${full.reason ? ` reason=${full.reason}` : ""}${full.channel ? ` channel=${full.channel}` : ""}${full.toolCallId ? ` tool=${full.toolCallId}` : ""}`,
+	);
 	return full;
 }
 
@@ -420,12 +441,15 @@ function bumpSuppressed(reason: string): void {
 	stats.suppressed[reason] = (stats.suppressed[reason] ?? 0) + 1;
 }
 
-function buildNote(kind: ReviewKind, severity: Severity, defect: string, fired: { id: string; value: number }[], confidence: number | null, evidenceText: string | undefined): string {
-	const attrs: string[] = [
-		`severity="${severity}"`,
-		`defect="${escapeAttr(defect)}"`,
-		'guidance="weigh, don\'t blindly obey"',
-	];
+function buildNote(
+	kind: ReviewKind,
+	severity: Severity,
+	defect: string,
+	fired: { id: string; value: number }[],
+	confidence: number | null,
+	evidenceText: string | undefined,
+): string {
+	const attrs: string[] = [`severity="${severity}"`, `defect="${escapeAttr(defect)}"`, 'guidance="weigh, don\'t blindly obey"'];
 	for (const f of fired) attrs.push(`${f.id}="${fmt2(f.value)}"`);
 	if (confidence !== null) attrs.push(`confidence="${fmt2(confidence)}"`);
 	if (evidenceText) attrs.push(`evidence="${escapeAttr(evidenceText)}"`);
@@ -435,26 +459,31 @@ function buildNote(kind: ReviewKind, severity: Severity, defect: string, fired: 
 }
 
 /** Advisory role's note — mirrors omp's native `<advisory>` element shape exactly. */
-function buildAdvisoryNote(kind: ReviewKind, severity: Severity, theme: string, fired: { id: string; value: number }[], confidence: number | null, evidenceText: string | undefined): string {
-	const attrs: string[] = [
-		'advisor="TypeSafe"',
-		`severity="${severity}"`,
-		'guidance="weigh, don\'t blindly obey"',
-		`theme="${escapeAttr(theme)}"`,
-	];
+function buildAdvisoryNote(
+	kind: ReviewKind,
+	severity: Severity,
+	theme: string,
+	fired: { id: string; value: number }[],
+	confidence: number | null,
+	evidenceText: string | undefined,
+): string {
+	const attrs: string[] = ['advisor="TypeSafe"', `severity="${severity}"`, 'guidance="weigh, don\'t blindly obey"', `theme="${escapeAttr(theme)}"`];
 	for (const f of fired) attrs.push(`${f.id}="${fmt2(f.value)}"`);
 	if (confidence !== null) attrs.push(`confidence="${fmt2(confidence)}"`);
 	if (evidenceText) attrs.push(`evidence="${escapeAttr(evidenceText)}"`);
 	const firedNames = fired.map((f) => f.id).join(", ");
 	const top = fired.reduce<{ id: string; value: number } | null>((acc, f) => (acc === null || f.value > acc.value ? f : acc), null);
 	const topDef = top ? SHARED_NOULS[top.id] : undefined;
-	const claim = topDef
-		? `${topDef.whenTrue} (${top!.id}).`
-		: `TypeSafe advisory review of the last ${KIND_NOUN[kind]} raises ${theme}${firedNames ? ` (${firedNames})` : ""}.`;
+	const claim = topDef ? `${topDef.whenTrue} (${top!.id}).` : `TypeSafe advisory review of the last ${KIND_NOUN[kind]} raises ${theme}${firedNames ? ` (${firedNames})` : ""}.`;
 	return `<advisory ${attrs.join(" ")}>\n${claim} Consider this before continuing.\n</advisory>`;
 }
 
-function routeDelivery(kind: ReviewKind, severity: Severity, entries: EntryView[], ctx: CtxLike): { channel: "aside" | "steer" | "nextTurn"; triggerTurn: boolean; immuneDowngrade: boolean } {
+function routeDelivery(
+	kind: ReviewKind,
+	severity: Severity,
+	entries: EntryView[],
+	ctx: CtxLike,
+): { channel: "aside" | "steer" | "nextTurn"; triggerTurn: boolean; immuneDowngrade: boolean } {
 	let channel: "aside" | "steer" | "nextTurn";
 	let triggerTurn = false;
 	if (severity === "nit") {
@@ -492,7 +521,14 @@ export interface ReviewOpts {
  * Run one review: build the battery, ask Jev, derive severity, guard, deliver.
  * Never throws; all outcomes are recorded in the ring buffer.
  */
-export async function review(pi: PiLike, kind: ReviewKind, state: Record<string, unknown>, ctx: CtxLike, opts: ReviewOpts = {}, role: TypesafeRole = "adversarial"): Promise<ReviewOutcome> {
+export async function review(
+	pi: PiLike,
+	kind: ReviewKind,
+	state: Record<string, unknown>,
+	ctx: CtxLike,
+	opts: ReviewOpts = {},
+	role: TypesafeRole = "adversarial",
+): Promise<ReviewOutcome> {
 	const cfg = getConfig().adversary;
 	const toolCallId = opts.toolCallId;
 	const stateSummary: Record<string, string> = {};
@@ -503,10 +539,10 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 	const blank = { stateSummary, role, ...(toolCallId ? { toolCallId } : {}) };
 	let nonBlockerEmittedThisUpdate = 0;
 	try {
-		if (!apiKeyPresent()) {
-			bumpSuppressed("no_api_key");
-			record(pi, kind, { severity: "none", decision: "suppressed", reason: "no_api_key", ...blank }, { inputTokens: 0, outputTokens: 0 });
-			return { severity: "none", decision: "suppressed", reason: "no_api_key" };
+		if (!ctx.models || !ctx.modelRegistry || !ctx.sessionManager || !judgeAvailable(ctx as JudgeContext)) {
+			bumpSuppressed("no_native_judge");
+			record(pi, kind, { severity: "none", decision: "suppressed", reason: "no_native_judge", ...blank }, { inputTokens: 0, outputTokens: 0 });
+			return { severity: "none", decision: "suppressed", reason: "no_native_judge" };
 		}
 		if (!consumeCallBudget()) {
 			bumpSuppressed("call_budget");
@@ -514,13 +550,19 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			return { severity: "none", decision: "suppressed", reason: "call_budget" };
 		}
 		const battery = buildBattery(kind, role);
-		const { result } = await ask(state, battery.questions, { timeoutMs: cfg.timeoutMs, maxRetries: 0 });
-		const usage = { inputTokens: result.usage?.input_tokens ?? 0, outputTokens: result.usage?.output_tokens ?? 0 };
+		const judgmentState = JSON.parse(JSON.stringify(state)) as JudgmentState;
+		const { result } = await ask(ctx as JudgeContext, judgmentState, battery.questions, {
+			timeoutMs: cfg.timeoutMs,
+		});
+		const usage = {
+			inputTokens: result.usage?.input_tokens ?? 0,
+			outputTokens: result.usage?.output_tokens ?? 0,
+		};
 		const answers = result.answers ?? {};
 		const severityAnswer = answers.severity as WireAnswer | undefined;
 		const sevScore = numField(severityAnswer, "score") ?? 0;
-		const severity: Severity | "none" =
-			sevScore >= cfg.blocker_severity ? "blocker" : sevScore >= cfg.concern_severity ? "concern" : "pending";
+		const pendingSeverity = sevScore < cfg.concern_severity;
+		const severity: Severity | "none" = sevScore >= cfg.blocker_severity ? "blocker" : pendingSeverity ? "none" : "concern";
 		let maxNoul = 0;
 		const fired: { id: string; value: number }[] = [];
 		for (const id of battery.escalationNoulIds) {
@@ -528,7 +570,7 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 			if (value > maxNoul) maxNoul = value;
 			if (value >= cfg.noul_floor) fired.push({ id, value });
 		}
-		let finalSeverity: Severity | "none" = severity === "pending" ? (maxNoul >= cfg.noul_floor ? "nit" : "none") : severity;
+		let finalSeverity: Severity | "none" = pendingSeverity ? (maxNoul >= cfg.noul_floor ? "nit" : "none") : severity;
 		const defectAnswer = answers[battery.defectKey] as WireAnswer | undefined;
 		const rawDefect = typeof defectAnswer?.choice === "string" ? defectAnswer.choice : "unclassified";
 		const defectConfidence = numField(defectAnswer, "confidence");
@@ -550,7 +592,20 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 		}
 		if (finalSeverity === "nit" && !cfg.emitNits) {
 			bumpSuppressed("nits_disabled");
-			record(pi, kind, { severity: "nit", decision: "suppressed", reason: "nits_disabled", scores, defect, fired: fired.map((f) => f.id), ...blank }, usage);
+			record(
+				pi,
+				kind,
+				{
+					severity: "nit",
+					decision: "suppressed",
+					reason: "nits_disabled",
+					scores,
+					defect,
+					fired: fired.map((f) => f.id),
+					...blank,
+				},
+				usage,
+			);
 			return { severity: "nit", decision: "suppressed", reason: "nits_disabled" };
 		}
 
@@ -563,26 +618,63 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 		const norm = normalizeNote(note);
 		if (CONTENT_FREE_NOTES.has(norm) || norm.length < 20) {
 			bumpSuppressed("content_free");
-			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "content_free", scores, defect, ...blank }, usage);
+			record(
+				pi,
+				kind,
+				{
+					severity: finalSeverity,
+					decision: "suppressed",
+					reason: "content_free",
+					scores,
+					defect,
+					...blank,
+				},
+				usage,
+			);
 			return { severity: finalSeverity, decision: "suppressed", reason: "content_free" };
 		}
 		// Severity-aware dedupe on the semantic content (kind + which questions fired),
 		// not the exact text — probability drift between cycles must not revive a note.
 		// A strictly higher severity than any prior note with the same key passes once
 		// (genuine escalation nit → concern → blocker).
-		const semanticKey = `${kind}|${fired.map((f) => f.id).sort().join(",")}`;
-		const priorHighest = noteHistory
-			.filter((h) => h.key === semanticKey)
-			.reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
+		const semanticKey = `${kind}|${fired
+			.map((f) => f.id)
+			.sort()
+			.join(",")}`;
+		const priorHighest = noteHistory.filter((h) => h.key === semanticKey).reduce<number | null>((acc, h) => (acc === null || h.sev > acc ? h.sev : acc), null);
 		if (priorHighest !== null && priorHighest >= SEVERITY_ORDER[finalSeverity]) {
 			bumpSuppressed("duplicate");
-			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "duplicate", scores, defect, ...blank }, usage);
+			record(
+				pi,
+				kind,
+				{
+					severity: finalSeverity,
+					decision: "suppressed",
+					reason: "duplicate",
+					scores,
+					defect,
+					...blank,
+				},
+				usage,
+			);
 			return { severity: finalSeverity, decision: "suppressed", reason: "duplicate" };
 		}
 		// Per-update budget: non-blocker notes are capped per review update; blockers exempt.
 		if (finalSeverity !== "blocker" && nonBlockerEmittedThisUpdate >= cfg.maxNotesPerUpdate) {
 			bumpSuppressed("update_budget");
-			record(pi, kind, { severity: finalSeverity, decision: "suppressed", reason: "update_budget", scores, defect, ...blank }, usage);
+			record(
+				pi,
+				kind,
+				{
+					severity: finalSeverity,
+					decision: "suppressed",
+					reason: "update_budget",
+					scores,
+					defect,
+					...blank,
+				},
+				usage,
+			);
 			return { severity: finalSeverity, decision: "suppressed", reason: "update_budget" };
 		}
 		const branchEntries = scanBranch(ctx.sessionManager?.getBranch?.());
@@ -594,14 +686,36 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 
 		const options: Record<string, unknown> = { deliverAs: routed.channel };
 		if (routed.triggerTurn) options.triggerTurn = true;
-		await pi.sendMessage({ customType: role === "advisory" ? "ai.typesafe.advisory" : "ai.typesafe.adversary", content: note, display: true, attribution: "agent" }, options);
+		await pi.sendMessage(
+			{
+				customType: role === "advisory" ? "ai.typesafe.advisory" : "ai.typesafe.adversary",
+				content: note,
+				display: true,
+				attribution: "agent",
+			},
+			options,
+		);
 		if (finalSeverity !== "blocker") nonBlockerEmittedThisUpdate += 1;
 		stats.delivered[finalSeverity] += 1;
 		if (routed.channel === "steer") {
 			stats.steers += 1;
 			immuneRemaining = cfg.immuneTurns;
 		}
-		record(pi, kind, { severity: finalSeverity, decision: "delivered", channel: routed.channel, scores, defect, fired: fired.map((f) => f.id), note, ...blank }, usage);
+		record(
+			pi,
+			kind,
+			{
+				severity: finalSeverity,
+				decision: "delivered",
+				channel: routed.channel,
+				scores,
+				defect,
+				fired: fired.map((f) => f.id),
+				note,
+				...blank,
+			},
+			usage,
+		);
 		return { severity: finalSeverity, note, decision: "delivered", channel: routed.channel };
 	} catch (err) {
 		stats.errors += 1;
@@ -614,4 +728,3 @@ export async function review(pi: PiLike, kind: ReviewKind, state: Record<string,
 		return { severity: "none", decision: "error", reason: describeError(err) };
 	}
 }
-

@@ -1,32 +1,29 @@
 {
-  "name": "omp-typesafe",
-  "version": "0.1.1",
-  "description": "TypeSafe AI (Jev) adversarial reviewer and typesafe_ask tool for the omp coding agent",
-  "license": "MIT",
-  "author": "Abdullah Siddique",
-  "type": "module",
-  "repository": "github:siddicky/omp-typesafe",
-  "homepage": "https://github.com/siddicky/omp-typesafe#readme",
-  "keywords": [
-    "omp",
-    "oh-my-pi",
-    "typesafe-ai",
-    "jev",
-    "adversarial-review",
-    "extension"
-  ],
-  "files": [
-    "src",
-    "README.md",
-    "LICENSE",
-    "assets"
-  ],
-  "omp": {
-    "extensions": [
-      "./src/index.ts"
-    ]
-  },
-  "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0"
-  }
+	"name": "omp-typesafe",
+	"version": "0.1.1",
+	"description": "TypeSafe AI (Jev) adversarial reviewer and typesafe_ask tool for the omp coding agent",
+	"keywords": [
+		"adversarial-review",
+		"extension",
+		"jev",
+		"oh-my-pi",
+		"omp",
+		"typesafe-ai"
+	],
+	"homepage": "https://github.com/siddicky/omp-typesafe#readme",
+	"license": "MIT",
+	"author": "Abdullah Siddique",
+	"repository": "github:siddicky/omp-typesafe",
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE",
+		"assets"
+	],
+	"type": "module",
+	"omp": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	}
 }

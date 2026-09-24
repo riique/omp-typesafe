@@ -1,8 +1,10 @@
 # omp-typesafe
 
-A reviewer for the [omp](https://omp.sh/docs) coding agent, powered by [TypeSafe AI](https://typesafe.ai)'s
-System One model (Jev). It follows omp's advisor pattern — a second set of eyes that watches the session as it
-unfolds — in one of two roles, set by `role` in config (default `adversarial`):
+A reviewer for the [omp](https://omp.sh/docs) coding agent, powered by Jev through omp's native judgment API.
+It follows omp's advisor pattern — a second set of eyes that watches the session as it unfolds — in one of two
+roles, set by `role` in config (default `adversarial`). The reviewer resolves `@judge` through omp's model-role
+configuration, so `modelRoles.judge: openrouter/~typesafe/jev-latest` uses OpenRouter's native decisions endpoint
+and the credentials already configured in omp.
 
 - **`adversarial`** (default): argues the other side — that the last action or claim is wrong, unverified, or
   incomplete.
@@ -12,15 +14,15 @@ unfolds — in one of two roles, set by `role` in config (default `adversarial`)
 Delivery (which channel a note goes out on, when it steers, dedupe, budgets) is identical between roles; only
 the question battery and note wording differ. Notes from either role are advisory; nothing is ever blocked.
 
-It also registers a `typesafe_ask` tool exposing all three TypeSafe primitives (noul, choice, score) for direct use.
+It also registers a `typesafe_ask` tool exposing all three native judgment question types (`noul`, `choice`, and `score`) for direct use.
 
 ## What it watches
 
-| Trigger | What Jev judges |
-|---|---|
+| Trigger                                                                               | What Jev judges                                                                                                                 |
+| ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | `tool_result` (edit, write, apply_patch, ast_edit, bash, eval, notebook, debug, task) | `breaks_contract`, `unfounded_assumption`, `incomplete_cutover`, `not_what_was_asked`, `unverified_claim`, `hidden_destruction` |
-| `message_end` (assistant messages ≥ 200 chars) | `unsupported_claim`, `requirement_missed`, `risky_api`, `weak_verification`, `unnecessary_complexity` |
-| `turn_end` (transcript delta since last review) | `requirement_missed`, `weak_verification`, `unnecessary_complexity`, `silent_scope_reduction`, `risky_api` |
+| `message_end` (assistant messages ≥ 200 chars)                                        | `unsupported_claim`, `requirement_missed`, `risky_api`, `weak_verification`, `unnecessary_complexity`                           |
+| `turn_end` (transcript delta since last review)                                       | `requirement_missed`, `weak_verification`, `unnecessary_complexity`, `silent_scope_reduction`, `risky_api`                      |
 
 Every battery ends with a shared severity score (`Nothing to raise` → `Nit` → `Concern` → `Blocker`) and a
 `defect_class` choice. Because Jev has no tools, the extension gathers evidence deterministically before asking:
@@ -75,12 +77,12 @@ deep-interview brownfield weights:
 ambiguity = 1 - (goal*0.35 + constraints*0.25 + criteria*0.25 + context*0.15)
 ```
 
-| Dimension | What is rated |
-|---|---|
-| `goal_clarity` | Is the primary objective statable in one sentence with named entities and no qualifier left to interpret? |
+| Dimension            | What is rated                                                                                             |
+| -------------------- | --------------------------------------------------------------------------------------------------------- |
+| `goal_clarity`       | Is the primary objective statable in one sentence with named entities and no qualifier left to interpret? |
 | `constraint_clarity` | Are the boundaries, non-goals, and limits clear enough that an out-of-scope change would be recognizable? |
-| `criteria_clarity` | Could a test be written today — trigger, expected result, failure condition? |
-| `context_clarity` | Is the existing code read and confirmed, and do the named entities map to real code structures? |
+| `criteria_clarity`   | Could a test be written today — trigger, expected result, failure condition?                              |
+| `context_clarity`    | Is the existing code read and confirmed, and do the named entities map to real code structures?           |
 
 Each dimension also carries a `gap_<dim>` choice naming the most likely missing piece, and one `user_can_answer`
 noul that keeps the gate from asking about things the model should simply look up. The **weakest** dimension is
@@ -89,12 +91,12 @@ deterministic question template, filled with the entity from the task text. The 
 
 The gate steers early and blocks at submission:
 
-| Trigger | Behavior above threshold |
-|---|---|
-| `before_agent_start` in plan mode | Scores the raw prompt and delivers an `<ambiguity-gate>` aside naming the weakest dimension and a drafted question. |
-| `turn_end` in plan mode | Rescores with the plan so far and any `ask` answers seen; re-steers only for a new weakest dimension, and never inside a steer's immune window. |
+| Trigger                                   | Behavior above threshold                                                                                                                                                                |
+| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `before_agent_start` in plan mode         | Scores the raw prompt and delivers an `<ambiguity-gate>` aside naming the weakest dimension and a drafted question.                                                                     |
+| `turn_end` in plan mode                   | Rescores with the plan so far and any `ask` answers seen; re-steers only for a new weakest dimension, and never inside a steer's immune window.                                         |
 | `tool_call` for `write` to `xd://propose` | With a UI, the plan submission is blocked with the drafted question in the reason. Headless there is no `ask` tool, so the attempt is recorded as `would_block` and the write proceeds. |
-| `tool_result` for `ask` | Records the question and answer so later scores see them; no Jev call. |
+| `tool_result` for `ask`                   | Records the question and answer so later scores see them; no Jev call.                                                                                                                  |
 
 Notes look like:
 
@@ -105,9 +107,10 @@ Ask the user before deciding: What is explicitly out of scope for rate limiter? 
 ```
 
 Gate messages carry `customType: "ai.typesafe.ambiguity"`, so they are countable separately from review notes.
-The gate is active only while plan mode is on (the `plan-mode-context` marker), only with `TYPESAFE_API_KEY` set,
-and only until `maxAsksPerPlan` asks have been observed. A Jev failure or timeout is a no-op — it never blocks.
-`/adversary status` prints the last score, and `/typesafe`-style config lives under `ambiguityGate`:
+The gate is active only while plan mode is on (the `plan-mode-context` marker), a native judgment model resolves
+from `@judge`, and fewer than `maxAsksPerPlan` asks have been observed. A Jev failure or timeout is a no-op — it
+never blocks. `/adversary status` prints the resolved judge and last score, and the gate config lives under
+`ambiguityGate`:
 
 ```json
 "ambiguityGate": {
@@ -126,60 +129,66 @@ The rubric levels and the 0.20 threshold are starting points; `TYPESAFE_BENCH_LO
 
 ## Install
 
-Requires omp and a `TYPESAFE_API_KEY` ([typesafe.ai](https://typesafe.ai)). Without the key the extension loads,
-logs a warning, and stays inactive — it never wedges the agent.
+Requires omp with a native judgment model configured for the `judge` role. For OpenRouter Jev:
 
-```sh
-omp plugin install github:siddicky/omp-typesafe
-export TYPESAFE_API_KEY=...
+```yaml
+modelRoles:
+  judge: openrouter/~typesafe/jev-latest
 ```
 
-Or from a clone:
+Configure OpenRouter credentials in omp as usual. No `TYPESAFE_API_KEY` is needed; the extension uses the model
+and credential resolved by omp for `@judge`. It makes native judgment requests to OpenRouter's decisions API.
+
+Install the maintained fork/branch after publishing it:
 
 ```sh
-git clone https://github.com/siddicky/omp-typesafe && cd omp-typesafe
-bun install
-omp plugin link "$PWD"
+omp plugin install github:<your-github-user>/omp-typesafe#openrouter-native-judge --force
 ```
 
-Newly added extension modules need a full omp restart (`/reload-plugins` is not enough).
+Restart omp fully after installing or replacing the extension module (`/reload-plugins` is not enough).
+
+### Updating from upstream
+
+The adaptation lives on the `openrouter-native-judge` branch of your fork; do not edit the installed `node_modules`
+copy. To bring in upstream changes, fetch `siddicky/omp-typesafe`, merge or rebase its `main` into this branch,
+resolve conflicts, run `bun test`, then push the branch to your fork and reinstall it with the command above. This
+keeps the adaptation in Git and makes updates deliberate rather than overwriting local changes.
 
 ## Commands and tool
 
 - `/adversary` — toggle for this session; `/adversary on|off|status|last|dump|role advisory|adversarial`
   (`role` overrides `role`/`TYPESAFE_ROLE` for the rest of the session; `status` reports the resolved role)
-- `/typesafe test` — one fixed probe: noul value, resolved model, latency, token usage
+- `/typesafe test` — one fixed probe through `@judge`: noul value, resolved model/API, latency, tokens, and billed cost
 - `typesafe_ask` — tool with `state` (text, or JSON with `stateFormat: "json"`) and `questions[]` of
-  `{ id, type: "noul"|"choice"|"score", instructions, options?, levels?, whenTrue?, whenFalse? }`
+  `{ id, type: "noul"|"choice"|"score", instructions, options?, levels?, whenTrue?, whenFalse? }`; optional `model` overrides `@judge` for that call
 
 ## Configuration
 
-`~/.omp/agent/typesafe.json` (absent = defaults):
+`~/.omp/agent/typesafe.json` (absent = defaults). The model is selected by omp's `modelRoles.judge`, not by this file:
 
 ```json
 {
-  "model": "jev-latest",
-  "role": "adversarial",
-  "phases": ["plan", "execute"],
-  "adversary": {
-    "enabled": true,
-    "reviewActions": true,
-    "reviewMessages": true,
-    "reviewTurns": true,
-    "tools": ["edit", "write", "apply_patch", "ast_edit", "bash", "eval", "notebook", "debug", "task"],
-    "inlineActionNotes": true,
-    "evidence": true,
-    "noul_floor": 0.45,
-    "concern_severity": 1.5,
-    "blocker_severity": 2.5,
-    "emitNits": false,
-    "maxNotesPerUpdate": 4,
-    "maxCallsPerTurn": 8,
-    "immuneTurns": 3,
-    "minMessageChars": 200,
-    "timeoutMs": 1500
-  },
-  "stopGate": { "enabled": false, "unfinished_threshold": 0.70, "verified_floor": 0.25 }
+	"role": "adversarial",
+	"phases": ["plan", "execute"],
+	"adversary": {
+		"enabled": true,
+		"reviewActions": true,
+		"reviewMessages": true,
+		"reviewTurns": true,
+		"tools": ["edit", "write", "apply_patch", "ast_edit", "bash", "eval", "notebook", "debug", "task"],
+		"inlineActionNotes": true,
+		"evidence": true,
+		"noul_floor": 0.45,
+		"concern_severity": 1.5,
+		"blocker_severity": 2.5,
+		"emitNits": false,
+		"maxNotesPerUpdate": 4,
+		"maxCallsPerTurn": 8,
+		"immuneTurns": 3,
+		"minMessageChars": 200,
+		"timeoutMs": 1500
+	},
+	"stopGate": { "enabled": false, "unfinished_threshold": 0.7, "verified_floor": 0.25 }
 }
 ```
 
@@ -195,14 +204,14 @@ when work looks unfinished or unverified.
 These win over both the config file and the values above, applied in this order once the file (or its absence)
 is resolved:
 
-| Variable | Effect |
-|---|---|
-| `TYPESAFE_CONFIG` | An alternate config file path, read instead of `~/.omp/agent/typesafe.json`. |
-| `TYPESAFE_ROLE` | `"advisory"` or `"adversarial"` — overrides `role`. |
-| `TYPESAFE_REVIEW_ENABLED` | `"0"`/`"false"` disables `adversary.enabled`; `"1"`/`"true"` enables it. |
-| `TYPESAFE_AMBIGUITY_GATE` | `"0"`/`"false"` disables `ambiguityGate.enabled`; `"1"`/`"true"` enables it. |
-| `TYPESAFE_AMBIGUITY_THRESHOLD` | A float in `0..1` — overrides `ambiguityGate.threshold`. |
-| `TYPESAFE_BENCH_LOG` | A file path. On session shutdown, writes `{ role, phases, stats, usage, costUsd, lastResolvedModel, history, ambiguity }` as JSON to it (reviewer telemetry for a single run). Unset by default; never throws on write failure. |
+| Variable                       | Effect                                                                                                                                                                                                                          |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TYPESAFE_CONFIG`              | An alternate config file path, read instead of `~/.omp/agent/typesafe.json`.                                                                                                                                                    |
+| `TYPESAFE_ROLE`                | `"advisory"` or `"adversarial"` — overrides `role`.                                                                                                                                                                             |
+| `TYPESAFE_REVIEW_ENABLED`      | `"0"`/`"false"` disables `adversary.enabled`; `"1"`/`"true"` enables it.                                                                                                                                                        |
+| `TYPESAFE_AMBIGUITY_GATE`      | `"0"`/`"false"` disables `ambiguityGate.enabled`; `"1"`/`"true"` enables it.                                                                                                                                                    |
+| `TYPESAFE_AMBIGUITY_THRESHOLD` | A float in `0..1` — overrides `ambiguityGate.threshold`.                                                                                                                                                                        |
+| `TYPESAFE_BENCH_LOG`           | A file path. On session shutdown, writes `{ role, phases, stats, usage, costUsd, lastResolvedModel, history, ambiguity }` as JSON to it (reviewer telemetry for a single run). Unset by default; never throws on write failure. |
 
 ### Review priorities
 
@@ -218,9 +227,9 @@ working directory). Nothing is installed automatically: starter files for both r
 
 ## Cost and latency
 
-Jev is priced on input tokens only ($0.042 / Mtok at time of writing) and answers in ~150–400 ms. Reviews use
-`timeoutMs` with no retries, so a slow or unreachable API costs at most that much per review and never a failure.
-`/adversary status` shows session token usage and estimated cost.
+Review latency depends on the configured judge provider. `/adversary status` shows session token usage and billed
+cost reported by the native judgment API (when available). Each review uses the configured timeout and provider's
+native judgment request/retry behavior; a failed or unreachable judge never blocks the primary agent.
 
 ## Layout
 

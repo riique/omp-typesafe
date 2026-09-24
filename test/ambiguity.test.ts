@@ -1,10 +1,8 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 /**
- * ambiguity.ts unit tests. src/client.ts is mocked exactly as in reviewer.test.ts so
- * scoreAmbiguity runs with no network: `ask` returns a queued answer set and the
- * question builders are pass-throughs (their shape is never inspected before being
- * handed to `ask`).
+ * ambiguity.ts unit tests. The native judge client is mocked so scoreAmbiguity
+ * runs without network access and returns queued answers.
  */
 
 interface QueuedAnswer {
@@ -16,18 +14,36 @@ let queuedAnswers: Record<string, QueuedAnswer> = {};
 let askShouldThrow = false;
 
 mock.module("../src/client", () => ({
-	apiKeyPresent: () => true,
-	ask: async (_state: unknown, _questions: unknown, _opts: unknown) => {
+	judgeAvailable: () => true,
+	ask: async (_ctx: unknown, _state: unknown, _questions: unknown, _opts: unknown) => {
 		if (askShouldThrow) throw new Error("boom");
 		return {
-			result: { model: "jev-test", answers: queuedAnswers, usage: { input_tokens: 10, output_tokens: 0 } },
+			result: {
+				model: "jev-test",
+				api: "openrouter-decisions",
+				provider: "openrouter",
+				answers: queuedAnswers,
+				usage: { input_tokens: 10, output_tokens: 0, cost: 0 },
+			},
 			requestId: "test-request",
 		};
 	},
 	describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
-	noul: (instructions: string, opts?: { true?: string; false?: string }) => ({ type: "noul", instructions, ...opts }),
-	choice: (instructions: string, criteria: Record<string, string>) => ({ type: "choice", instructions, criteria }),
-	score: (instructions: string, levels: readonly string[]) => ({ type: "score", instructions, levels: [...levels] }),
+	noul: (instructions: string, opts?: { true?: string; false?: string }) => ({
+		type: "noul",
+		instructions,
+		...opts,
+	}),
+	choice: (instructions: string, criteria: Record<string, string>) => ({
+		type: "choice",
+		instructions,
+		criteria,
+	}),
+	score: (instructions: string, levels: readonly string[]) => ({
+		type: "score",
+		instructions,
+		levels: [...levels],
+	}),
 }));
 
 const {
@@ -232,6 +248,17 @@ describe("battery shape", () => {
 
 describe("scoreAmbiguity", () => {
 	const pi = { logger: {} };
+	const ctx = {
+		models: {
+			resolve: () => ({
+				provider: "openrouter",
+				id: "~typesafe/jev-latest",
+				api: "openrouter-decisions",
+			}),
+		},
+		modelRegistry: {},
+		sessionManager: { getSessionId: () => "test-session" },
+	};
 
 	beforeEach(() => {
 		askShouldThrow = false;
@@ -250,7 +277,7 @@ describe("scoreAmbiguity", () => {
 	});
 
 	test("normalizes 0-4 scores to 0..1 and composes the ambiguity", async () => {
-		const out = await scoreAmbiguity(pi, { task: "Add a rate limiter to the API" }, GATE_CFG);
+		const out = await scoreAmbiguity(pi, { task: "Add a rate limiter to the API" }, GATE_CFG, ctx);
 		expect(out).not.toBeNull();
 		// clarity = 0.35*0.5 + 0.25*0.25 + 0.25*1 + 0.15*1 = 0.6375
 		expect(out!.ambiguity).toBeCloseTo(0.3625, 10);
@@ -259,7 +286,7 @@ describe("scoreAmbiguity", () => {
 	});
 
 	test("selects the weakest dimension and its gap, and drafts from that pair", async () => {
-		const out = await scoreAmbiguity(pi, { task: "Add a rate limiter to the API" }, GATE_CFG);
+		const out = await scoreAmbiguity(pi, { task: "Add a rate limiter to the API" }, GATE_CFG, ctx);
 		// shortfalls: goal 0.35*0.5=0.175, constraints 0.25*0.75=0.1875 — constraints is weakest.
 		expect(out!.weakest).toBe("constraints");
 		expect(out!.gap).toBe("non_goals");
@@ -268,12 +295,12 @@ describe("scoreAmbiguity", () => {
 
 	test("a Jev failure yields null so the caller decides none and never blocks", async () => {
 		askShouldThrow = true;
-		expect(await scoreAmbiguity(pi, { task: "anything" }, GATE_CFG)).toBeNull();
+		expect(await scoreAmbiguity(pi, { task: "anything" }, GATE_CFG, ctx)).toBeNull();
 	});
 
 	test("missing answers degrade to zero clarity rather than throwing", async () => {
 		queuedAnswers = {};
-		const out = await scoreAmbiguity(pi, { task: "anything" }, GATE_CFG);
+		const out = await scoreAmbiguity(pi, { task: "anything" }, GATE_CFG, ctx);
 		expect(out!.ambiguity).toBeCloseTo(1, 10);
 		expect(out!.userCanAnswer).toBe(0);
 	});

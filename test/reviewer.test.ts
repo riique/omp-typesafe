@@ -1,11 +1,9 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 /**
- * reviewer.ts unit tests. The `@typesafe-ai/sdk`-backed client wrapper (src/client.ts) is
- * mocked so tests run with no network: `ask` returns a queued, fully controlled answer set,
- * and `noul`/`choice`/`score` are simple pass-through question builders (their exact shape is
- * never inspected by reviewer.ts before it hands them to `ask`). `pi.sendMessage` is a fake
- * recorder so delivery can be asserted without a real omp host.
+ * reviewer.ts unit tests. The native judge wrapper (src/client.ts) is mocked so tests run
+ * without network access. `ask` returns a queued answer set, and `pi.sendMessage` records
+ * reviewer delivery without a real omp host.
  */
 
 interface QueuedAnswer {
@@ -14,11 +12,11 @@ interface QueuedAnswer {
 }
 
 let queuedAnswers: Record<string, QueuedAnswer> = {};
-let apiKeyPresentValue = true;
+let judgeAvailableValue = true;
 
 mock.module("../src/client", () => ({
-	apiKeyPresent: () => apiKeyPresentValue,
-	ask: async (_state: unknown, _questions: unknown, _opts: unknown) => ({
+	judgeAvailable: () => judgeAvailableValue,
+	ask: async (_ctx: unknown, _state: unknown, _questions: unknown, _opts: unknown) => ({
 		result: {
 			model: "jev-test",
 			answers: queuedAnswers,
@@ -27,9 +25,21 @@ mock.module("../src/client", () => ({
 		requestId: "test-request",
 	}),
 	describeError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
-	noul: (instructions: string, opts?: { true?: string; false?: string }) => ({ type: "noul", instructions, ...opts }),
-	choice: (instructions: string, criteria: Record<string, string>) => ({ type: "choice", instructions, criteria }),
-	score: (instructions: string, levels: readonly string[]) => ({ type: "score", instructions, levels: [...levels] }),
+	noul: (instructions: string, opts?: { true?: string; false?: string }) => ({
+		type: "noul",
+		instructions,
+		...opts,
+	}),
+	choice: (instructions: string, criteria: Record<string, string>) => ({
+		type: "choice",
+		instructions,
+		criteria,
+	}),
+	score: (instructions: string, levels: readonly string[]) => ({
+		type: "score",
+		instructions,
+		levels: [...levels],
+	}),
 }));
 
 const { review, buildBattery, getLastReviewRecord } = await import("../src/reviewer");
@@ -48,11 +58,15 @@ function choiceAnswer(value: string, confidence = 0.9): QueuedAnswer {
 }
 
 /** Build a full answer set for a battery: all noul ids default to 0, overrides applied on top. */
-function answersFor(kind: "action" | "message" | "turn", role: "adversarial" | "advisory", opts: {
-	severity: number;
-	nouls?: Record<string, number>;
-	defect?: string;
-}): Record<string, QueuedAnswer> {
+function answersFor(
+	kind: "action" | "message" | "turn",
+	role: "adversarial" | "advisory",
+	opts: {
+		severity: number;
+		nouls?: Record<string, number>;
+		defect?: string;
+	},
+): Record<string, QueuedAnswer> {
 	const battery = buildBattery(kind, role);
 	const answers: Record<string, QueuedAnswer> = { severity: scoreAnswer(opts.severity) };
 	for (const id of battery.noulIds) {
@@ -72,12 +86,24 @@ class FakePi {
 }
 
 function idleCtx(isIdle = false) {
-	return { hasUI: false, isIdle: () => isIdle, sessionManager: { getBranch: () => [] } };
+	return {
+		hasUI: false,
+		isIdle: () => isIdle,
+		models: {
+			resolve: () => ({
+				provider: "openrouter",
+				id: "~typesafe/jev-latest",
+				api: "openrouter-decisions",
+			}),
+		},
+		modelRegistry: {},
+		sessionManager: { getBranch: () => [], getSessionId: () => "test-session" },
+	};
 }
 
 beforeEach(() => {
 	queuedAnswers = {};
-	apiKeyPresentValue = true;
+	judgeAvailableValue = true;
 	resetReviewerSession();
 	beginTurn();
 });
@@ -111,7 +137,10 @@ describe("severity derivation — adversarial", () => {
 	});
 
 	test("low score but a noul above the default floor (0.45) -> nit, suppressed by default (emitNits=false)", async () => {
-		queuedAnswers = answersFor("message", "adversarial", { severity: 0.2, nouls: { requirement_missed: 0.6 } });
+		queuedAnswers = answersFor("message", "adversarial", {
+			severity: 0.2,
+			nouls: { requirement_missed: 0.6 },
+		});
 		const pi = new FakePi();
 		const outcome = await review(pi, "message", { task: "t" }, idleCtx(), {}, "adversarial");
 		expect(outcome.severity).toBe("nit");
@@ -148,7 +177,10 @@ describe("severity derivation — advisory", () => {
 	});
 
 	test("score in blocker band -> blocker, delivered as <advisory>", async () => {
-		queuedAnswers = answersFor("message", "advisory", { severity: 2.6, defect: "consider_requirement" });
+		queuedAnswers = answersFor("message", "advisory", {
+			severity: 2.6,
+			defect: "consider_requirement",
+		});
 		const pi = new FakePi();
 		const outcome = await review(pi, "message", { task: "t" }, idleCtx(), {}, "advisory");
 		expect(outcome.severity).toBe("blocker");
@@ -183,7 +215,10 @@ describe("on_track suppression (advisory only)", () => {
 	});
 
 	test("adversarial role is unaffected by an on_track-shaped answer (no such noul in its battery)", async () => {
-		queuedAnswers = answersFor("message", "adversarial", { severity: 1.6, nouls: { requirement_missed: 0.8 } });
+		queuedAnswers = answersFor("message", "adversarial", {
+			severity: 1.6,
+			nouls: { requirement_missed: 0.8 },
+		});
 		const pi = new FakePi();
 		const outcome = await review(pi, "message", { task: "t" }, idleCtx(true), {}, "adversarial");
 		expect(outcome.decision).toBe("delivered");
@@ -212,13 +247,19 @@ describe("both roles route identically for the same severity/context", () => {
 	});
 
 	test("blocker severity while active -> steer + triggerTurn for both roles", async () => {
-		queuedAnswers = answersFor("action", "adversarial", { severity: 2.6, nouls: { breaks_contract: 0.9 } });
+		queuedAnswers = answersFor("action", "adversarial", {
+			severity: 2.6,
+			nouls: { breaks_contract: 0.9 },
+		});
 		const piA = new FakePi();
 		const outA = await review(piA, "action", { task: "t" }, idleCtx(false), { toolCallId: "1" }, "adversarial");
 
 		resetReviewerSession();
 		beginTurn();
-		queuedAnswers = answersFor("action", "advisory", { severity: 2.6, nouls: { related_update_needed: 0.9 } });
+		queuedAnswers = answersFor("action", "advisory", {
+			severity: 2.6,
+			nouls: { related_update_needed: 0.9 },
+		});
 		const piB = new FakePi();
 		const outB = await review(piB, "action", { task: "t" }, idleCtx(false), { toolCallId: "1" }, "advisory");
 
@@ -232,7 +273,10 @@ describe("both roles route identically for the same severity/context", () => {
 
 	test("plan mode forces aside for both roles", async () => {
 		const planEntries = [{ type: "custom_message", customType: "plan-mode-context", content: "" }];
-		const planCtx = { hasUI: false, isIdle: () => false, sessionManager: { getBranch: () => planEntries } };
+		const planCtx = {
+			...idleCtx(false),
+			sessionManager: { ...idleCtx(false).sessionManager, getBranch: () => planEntries },
+		};
 
 		queuedAnswers = answersFor("message", "adversarial", { severity: 2.6 });
 		const piA = new FakePi();
@@ -240,7 +284,10 @@ describe("both roles route identically for the same severity/context", () => {
 
 		resetReviewerSession();
 		beginTurn();
-		queuedAnswers = answersFor("message", "advisory", { severity: 2.6, defect: "consider_requirement" });
+		queuedAnswers = answersFor("message", "advisory", {
+			severity: 2.6,
+			defect: "consider_requirement",
+		});
 		const piB = new FakePi();
 		const outB = await review(piB, "message", { task: "t" }, planCtx, {}, "advisory");
 
@@ -272,9 +319,13 @@ describe("adversarial note format is unchanged", () => {
 	});
 });
 
-describe("env / role wiring at the review() boundary", () => {
+describe("judge / role wiring at the review() boundary", () => {
 	test("role is taken from the explicit parameter, not any ambient config", async () => {
-		queuedAnswers = answersFor("turn", "advisory", { severity: 1.6, nouls: { should_clarify: 0.7 }, defect: "clarify_with_user" });
+		queuedAnswers = answersFor("turn", "advisory", {
+			severity: 1.6,
+			nouls: { should_clarify: 0.7 },
+			defect: "clarify_with_user",
+		});
 		const pi = new FakePi();
 		const outcome = await review(pi, "turn", { task: "t" }, idleCtx(true), {}, "advisory");
 		expect(outcome.note).toContain("<advisory ");
@@ -283,7 +334,11 @@ describe("env / role wiring at the review() boundary", () => {
 	});
 
 	test("every ReviewRecord carries the role that produced it", async () => {
-		queuedAnswers = answersFor("message", "advisory", { severity: 1.6, nouls: { should_clarify: 0.7 }, defect: "clarify_with_user" });
+		queuedAnswers = answersFor("message", "advisory", {
+			severity: 1.6,
+			nouls: { should_clarify: 0.7 },
+			defect: "clarify_with_user",
+		});
 		const pi = new FakePi();
 		await review(pi, "message", { task: "t" }, idleCtx(true), {}, "advisory");
 		expect(getLastReviewRecord()?.role).toBe("advisory");
@@ -296,20 +351,19 @@ describe("env / role wiring at the review() boundary", () => {
 		expect(getLastReviewRecord()?.role).toBe("adversarial");
 	});
 
-	test("role is recorded even on suppressed/none/error outcomes", async () => {
-		apiKeyPresentValue = false;
+	test("role is recorded even when the configured native judge is unavailable", async () => {
+		judgeAvailableValue = false;
 		const pi = new FakePi();
 		await review(pi, "message", { task: "t" }, idleCtx(), {}, "advisory");
 		expect(getLastReviewRecord()?.role).toBe("advisory");
-		apiKeyPresentValue = true;
 	});
 
-	test("no API key -> suppressed, no ask/sendMessage call regardless of role", async () => {
-		apiKeyPresentValue = false;
+	test("no native judge -> suppressed without delivery", async () => {
+		judgeAvailableValue = false;
 		const pi = new FakePi();
 		const outcome = await review(pi, "message", { task: "t" }, idleCtx(), {}, "advisory");
 		expect(outcome.decision).toBe("suppressed");
-		expect(outcome.reason).toBe("no_api_key");
+		expect(outcome.reason).toBe("no_native_judge");
 		expect(pi.sent.length).toBe(0);
 	});
 });
